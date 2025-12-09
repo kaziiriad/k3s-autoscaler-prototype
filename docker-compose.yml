@@ -1,0 +1,188 @@
+version: '3.8'
+
+services:
+  # K3s Master Node
+  k3s-master:
+    image: rancher/k3s:v1.29.1-k3s1
+    container_name: k3s-master
+    hostname: k3s-master
+    privileged: true
+    ports:
+      - "6443:6443"      # Kubernetes API
+    environment:
+      - K3S_TOKEN=mysupersecrettoken12345
+      - K3S_KUBECONFIG_OUTPUT=/output/kubeconfig
+      - K3S_KUBECONFIG_MODE=666
+      - K3S_DEBUG=true
+    volumes:
+      - k3s-master-data:/var/lib/rancher/k3s
+      - ./kubeconfig:/output
+    command: >
+      server
+      --https-listen-port=6443
+      --disable-network-policy
+      --disable=traefik
+      --disable=servicelb
+      --write-kubeconfig-mode=666
+      --cluster-cidr=10.42.0.0/16
+      --service-cidr=10.43.0.0/16
+    networks:
+      - k3s-network
+    healthcheck:
+      test: ["CMD", "kubectl", "get", "nodes"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # K3s Worker Nodes
+  k3s-worker-1:
+    image: rancher/k3s:v1.29.1-k3s1
+    container_name: k3s-worker-1
+    hostname: k3s-worker-1
+    privileged: true
+    depends_on:
+      k3s-master:
+        condition: service_healthy
+    environment:
+      - K3S_URL=https://k3s-master:6443
+      - K3S_TOKEN=mysupersecrettoken12345
+      - K3S_NODE_NAME=k3s-worker-1
+    volumes:
+      - k3s-worker-1-data:/var/lib/rancher/k3s
+      - ./kubeconfig:/output
+    command: agent
+    networks:
+      - k3s-network
+    restart: unless-stopped
+
+  k3s-worker-2:
+    image: rancher/k3s:v1.29.1-k3s1
+    container_name: k3s-worker-2
+    hostname: k3s-worker-2
+    privileged: true
+    depends_on:
+      k3s-master:
+        condition: service_healthy
+    environment:
+      - K3S_URL=https://k3s-master:6443
+      - K3S_TOKEN=mysupersecrettoken12345
+      - K3S_NODE_NAME=k3s-worker-2
+    volumes:
+      - k3s-worker-2-data:/var/lib/rancher/k3s
+      - ./kubeconfig:/output
+    command: agent
+    networks:
+      - k3s-network
+    restart: unless-stopped
+
+  # Prometheus Monitoring
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/scaling_rules.yml:/etc/prometheus/scaling_rules.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=7d'
+      - '--web.enable-admin-api'
+    networks:
+      - k3s-network
+    restart: unless-stopped
+
+  # Node Exporter for metrics
+  node-exporter:
+    image: prom/node-exporter:v1.6.1
+    container_name: node-exporter
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    networks:
+      - k3s-network
+    restart: unless-stopped
+
+  # kube-state-metrics - disabled for simplicity
+  # kube-state-metrics:
+  #   image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.10.0
+  #   container_name: kube-state-metrics
+  #   ports:
+  #     - "8081:8081"
+  #   command:
+  #     - --port=8081
+  #   networks:
+  #     - k3s-network
+  #   depends_on:
+  #     - k3s-master
+  #   restart: unless-stopped
+
+  # AlertManager
+  alertmanager:
+    image: prom/alertmanager:v0.24.0
+    container_name: alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    networks:
+      - k3s-network
+    restart: unless-stopped
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    networks:
+      - k3s-network
+    restart: unless-stopped
+
+  # The Autoscaler Service
+  autoscaler:
+    build:
+      context: ./autoscaler
+      dockerfile: Dockerfile
+    container_name: autoscaler
+    ports:
+      - "8080:8080"
+    depends_on:
+      - prometheus
+    volumes:
+      - ./kubeconfig:/config:ro
+      - ./autoscaler/config:/app/config:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - CONFIG_PATH=/app/config/config.yaml
+    networks:
+      - k3s-network
+    restart: unless-stopped
+
+networks:
+  k3s-network:
+    driver: bridge
+
+volumes:
+  k3s-master-data:
+  k3s-worker-1-data:
+  k3s-worker-2-data:
+  prometheus-data:
+  grafana-data:

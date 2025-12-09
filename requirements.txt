@@ -1,0 +1,13 @@
+# Core dependencies
+PyYAML>=6.0
+prometheus-client>=0.16.0
+
+# Optional: For real Kubernetes integration
+# kubernetes>=26.1.0
+
+# Optional: For HTTP APIs
+requests>=2.28.0
+
+# Development and testing
+pytest>=7.0.0
+pytest-cov>=4.0.0

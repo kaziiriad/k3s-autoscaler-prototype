@@ -1,0 +1,45 @@
+# Autoscaler Configuration
+autoscaler:
+  check_interval: 5                # Check every 5 seconds
+  dry_run: true                   # Set to false to actually scale containers
+
+  # Kubernetes connection settings
+  kubernetes:
+    in_cluster: false             # Running outside cluster
+    kubeconfig_path: "/config/kubeconfig"
+
+  # Scaling thresholds
+  thresholds:
+    pending_pods: 2               # Scale up when 2+ pods pending
+    cpu_threshold: 75            # Scale up when CPU > 75%
+    memory_threshold: 75         # Scale up when Memory > 75%
+    cpu_scale_down: 30           # Scale down when CPU < 30%
+    memory_scale_down: 30        # Scale down when Memory < 30%
+
+  # Scaling limits
+  limits:
+    min_nodes: 1                 # Minimum number of nodes
+    max_nodes: 6                 # Maximum number of nodes
+    scale_up_cooldown: 60        # Wait 60s after scale up
+    scale_down_cooldown: 120     # Wait 2 minutes after scale down
+
+  # Docker management (for adding/removing workers)
+  docker:
+    network: "k3s-network"       # Docker network name
+    worker_service: "k3s-worker"
+    image: "rancher/k3s:v1.29.1-k3s1"
+    cpu_limit: "1"
+    memory_limit: "2g"
+    api_delay: 3                  # Simulate API delay in seconds
+    boot_time: 30                # Time for new node to be ready
+
+# Logging
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "/app/autoscaler.log"
+
+# Alerting
+alerting:
+  enabled: true
+  webhook_url: "http://alertmanager:9093/api/v1/alerts"
