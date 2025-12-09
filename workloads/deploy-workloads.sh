@@ -12,7 +12,7 @@ if ! docker ps | grep -q k3s-master; then
 fi
 
 # Copy the workload file to the container
-docker cp test-workload.yaml k3s-master:/tmp/test-workload.yaml
+docker cp workloads/test-workload.yaml k3s-master:/tmp/test-workload.yaml
 
 # Apply the test workloads using kubectl in the container
 docker exec k3s-master kubectl apply -f /tmp/test-workload.yaml

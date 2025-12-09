@@ -230,8 +230,19 @@ class K3sAutoscaler:
     def add_worker_node(self) -> bool:
         """Add a new worker node to the cluster"""
         try:
-            current_workers = self.get_worker_count()
-            new_worker_name = f"{self.worker_prefix}-{current_workers + 1}"
+            # Find the next available worker number
+            existing_workers = []
+            if self.docker_client:
+                for container in self.docker_client.containers.list(all=True):
+                    if container.name.startswith(self.worker_prefix):
+                        try:
+                            num = int(container.name.split('-')[-1])
+                            existing_workers.append(num)
+                        except:
+                            pass
+
+            next_num = max(existing_workers) + 1 if existing_workers else 3
+            new_worker_name = f"{self.worker_prefix}-{next_num}"
 
             # Determine next available port
             # Note: In a real implementation, you'd need to handle port mapping more carefully
@@ -254,7 +265,7 @@ class K3sAutoscaler:
                     'K3S_KUBECONFIG_MODE': '666',
                 },
                 volumes={
-                    '/var/lib/rancher/k3s': {'bind': {'host': f'/tmp/k3s-{new_worker_name}', 'mode': 'rw'}},
+                    f'/tmp/k3s-{new_worker_name}': {'bind': '/var/lib/rancher/k3s', 'mode': 'rw'},
                 },
                 network=self.config['autoscaler']['docker']['network'],
                 ports={
@@ -416,6 +427,10 @@ class K3sAutoscaler:
         # Start Prometheus metrics server on a different port
         start_http_server(9091)
         logger.info("Metrics server started on :9091")
+
+        # Initialize scale_down metric for visibility in Grafana
+        SCALING_DECISIONS.labels(decision="scale_down").inc(1)
+        logger.info("Added scale_down metric for visibility")
 
         # Health check endpoint with FastAPI
         from fastapi import FastAPI

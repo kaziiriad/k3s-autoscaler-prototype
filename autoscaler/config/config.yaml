@@ -1,7 +1,7 @@
 # Autoscaler Configuration
 autoscaler:
   check_interval: 5                # Check every 5 seconds
-  dry_run: true                   # Set to false to actually scale containers
+  dry_run: false                   # Set to false to actually scale containers
 
   # Kubernetes connection settings
   kubernetes:
@@ -25,7 +25,7 @@ autoscaler:
 
   # Docker management (for adding/removing workers)
   docker:
-    network: "k3s-network"       # Docker network name
+    network: "prototype_k3s-network"  # Docker network name
     worker_service: "k3s-worker"
     image: "rancher/k3s:v1.29.1-k3s1"
     cpu_limit: "1"

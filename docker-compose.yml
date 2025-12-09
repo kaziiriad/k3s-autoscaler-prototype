@@ -170,9 +170,7 @@ services:
 
   # The Autoscaler Service
   autoscaler:
-    build:
-      context: ./autoscaler
-      dockerfile: Dockerfile
+    image: autoscaler-custom:latest
     container_name: autoscaler
     ports:
       - "8080:8080"

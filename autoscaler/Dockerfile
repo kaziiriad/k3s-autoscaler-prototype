@@ -12,7 +12,8 @@ COPY config/ ./config/
 
 # Create non-root user
 RUN useradd -m -u 1000 autoscaler
-USER autoscaler
+# Keep as root for Docker socket access, will drop privileges in dry run mode
+# USER autoscaler
 
 # Expose ports
 EXPOSE 8080 9091
