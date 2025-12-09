@@ -128,11 +128,25 @@ class K3sAutoscaler:
             })
             pending_pods = int(pending_response.json()['data']['result'][0]['value'][1]) if pending_response.json()['data']['result'] else 0
 
-            # Query node count
-            nodes_response = requests.get('http://prometheus:9090/api/v1/query', params={
-                'query': 'sum(kube_node_status_condition{condition="Ready",status="True"})'
-            })
-            current_nodes = int(nodes_response.json()['data']['result'][0]['value'][1]) if nodes_response.json()['data']['result'] else 0
+            # Query node count - count worker nodes only (exclude master)
+            try:
+                if self.k8s_client:
+                    from kubernetes import client as k8s_client
+                    v1 = k8s_client.CoreV1Api()
+                    nodes = v1.list_node()
+                    # Count worker nodes (nodes that are not master)
+                    worker_nodes = len([n for n in nodes.items
+                                      if n.status.conditions and
+                                      any(c.type == "Ready" and c.status == "True" for c in n.status.conditions) and
+                                      n.metadata.labels.get('node-role.kubernetes.io/control-plane') != 'true'])
+                    current_nodes = worker_nodes
+                    logger.info(f"Found {worker_nodes} worker nodes (excluding master)")
+                else:
+                    # Fallback to using docker containers count (approximation)
+                    current_nodes = 2  # Default to 2 worker nodes in dry run mode
+            except Exception as e:
+                logger.warning(f"Failed to get node count: {e}")
+                current_nodes = 2  # Default to 2 worker nodes
 
             # Query CPU utilization (if nodes available)
             avg_cpu = 0.0

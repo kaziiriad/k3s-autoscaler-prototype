@@ -1,0 +1,4 @@
+# This file will be dynamically updated by the autoscaler with worker node IPs
+targets:
+  - 'k3s-worker-1:9100'
+  - 'k3s-worker-2:9100'

@@ -1,0 +1,42 @@
+# Template for k3s worker with node-exporter sidecar
+# Use this when adding new workers during autoscaling
+
+services:
+  k3s-worker-X:
+    image: rancher/k3s:v1.29.1-k3s1
+    container_name: k3s-worker-X
+    hostname: k3s-worker-X
+    privileged: true
+    environment:
+      - K3S_URL=https://k3s-master:6443
+      - K3S_TOKEN=mysupersecrettoken12345
+      - K3S_NODE_NAME=k3s-worker-X
+      - K3S_WITH_NODE_ID=true
+    volumes:
+      - k3s-worker-X-data:/var/lib/rancher/k3s
+      - ./kubeconfig:/output
+    command: agent
+    networks:
+      - k3s-network
+    restart: unless-stopped
+    depends_on:
+      - node-exporter-X
+
+  node-exporter-X:
+    image: prom/node-exporter:v1.6.1
+    container_name: node-exporter-X
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    networks:
+      - k3s-network
+    restart: unless-stopped
+    pid: "service:k3s-worker-X"  # Share PID namespace to get host metrics

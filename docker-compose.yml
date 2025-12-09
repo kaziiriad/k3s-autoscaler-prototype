@@ -48,6 +48,7 @@ services:
       - K3S_URL=https://k3s-master:6443
       - K3S_TOKEN=mysupersecrettoken12345
       - K3S_NODE_NAME=k3s-worker-1
+      - K3S_WITH_NODE_ID=true
     volumes:
       - k3s-worker-1-data:/var/lib/rancher/k3s
       - ./kubeconfig:/output
@@ -68,6 +69,7 @@ services:
       - K3S_URL=https://k3s-master:6443
       - K3S_TOKEN=mysupersecrettoken12345
       - K3S_NODE_NAME=k3s-worker-2
+      - K3S_WITH_NODE_ID=true
     volumes:
       - k3s-worker-2-data:/var/lib/rancher/k3s
       - ./kubeconfig:/output
@@ -85,7 +87,10 @@ services:
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./monitoring/scaling_rules.yml:/etc/prometheus/scaling_rules.yml:ro
+      - ./monitoring/k3s-nodes.yml:/etc/prometheus/k3s-nodes.yml:ro
+      - ./kubeconfig/kubeconfig:/etc/prometheus/kubeconfig:ro
       - prometheus-data:/prometheus
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
@@ -114,19 +119,24 @@ services:
       - k3s-network
     restart: unless-stopped
 
-  # kube-state-metrics - disabled for simplicity
-  # kube-state-metrics:
-  #   image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.10.0
-  #   container_name: kube-state-metrics
-  #   ports:
-  #     - "8081:8081"
-  #   command:
-  #     - --port=8081
-  #   networks:
-  #     - k3s-network
-  #   depends_on:
-  #     - k3s-master
-  #   restart: unless-stopped
+  kube-state-metrics:
+    image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.10.0
+    container_name: kube-state-metrics
+    ports:
+      - "8081:8081"
+    environment:
+      - KUBECONFIG=/config/kubeconfig
+    volumes:
+      - ./kubeconfig:/config:ro
+    command:
+      - --kubeconfig=/config/kubeconfig
+      - --port=8081
+      - --telemetry-port=8082
+    networks:
+      - k3s-network
+    depends_on:
+      - k3s-master
+    restart: unless-stopped
 
   # AlertManager
   alertmanager:
@@ -149,9 +159,11 @@ services:
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/k3s-dashboard.json
     volumes:
       - grafana-data:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/k3s-dashboard.json:/var/lib/grafana/dashboards/k3s-dashboard.json:ro
     networks:
       - k3s-network
     restart: unless-stopped
@@ -164,6 +176,7 @@ services:
     container_name: autoscaler
     ports:
       - "8080:8080"
+      - "9091:9091"
     depends_on:
       - prometheus
     volumes:
