@@ -90,7 +90,26 @@ class K3sAutoscaler:
     def _init_k8s_client(self) -> client.CoreV1Api:
         """Initialize Kubernetes client"""
         try:
-            k8s_config.load_kube_config(config_file=self.config['autoscaler']['kubernetes']['kubeconfig_path'])
+            # Handle kubeconfig environment variable substitution
+            kubeconfig_path = self.config['autoscaler']['kubernetes']['kubeconfig_path']
+            if os.path.exists(kubeconfig_path):
+                # Read the kubeconfig and substitute environment variables
+                with open(kubeconfig_path, 'r') as f:
+                    kubeconfig_content = f.read()
+
+                # Substitute __K3S_SERVER_HOST__ if present
+                if '__K3S_SERVER_HOST__' in kubeconfig_content:
+                    k3s_server_host = os.getenv('K3S_SERVER_HOST', 'k3s-master')
+                    kubeconfig_content = kubeconfig_content.replace('__K3S_SERVER_HOST__', k3s_server_host)
+                    logger.info(f"Substituted K3S_SERVER_HOST={k3s_server_host} in kubeconfig")
+
+                    # Write to a temporary file
+                    temp_kubeconfig = '/tmp/kubeconfig'
+                    with open(temp_kubeconfig, 'w') as f:
+                        f.write(kubeconfig_content)
+                    kubeconfig_path = temp_kubeconfig
+
+            k8s_config.load_kube_config(config_file=kubeconfig_path)
             api = client.CoreV1Api()
             # Test connection
             api.get_api_resources()
@@ -148,21 +167,31 @@ class K3sAutoscaler:
                 logger.warning(f"Failed to get node count: {e}")
                 current_nodes = 2  # Default to 2 worker nodes
 
-            # Query CPU utilization (if nodes available)
+            # Query CPU utilization
             avg_cpu = 0.0
             if current_nodes > 0:
                 cpu_response = requests.get('http://prometheus:9090/api/v1/query', params={
-                    'query': 'avg(100 - (irate(node_cpu_seconds_total{mode="idle"}[5m]) * 100))'
+                    'query': 'avg(100 - (avg by (instance) (irate(node_cpu_seconds_total{mode="idle", job="node-exporter-k3s-nodes"}[5m])) * 100))'
                 })
                 avg_cpu = float(cpu_response.json()['data']['result'][0]['value'][1]) if cpu_response.json()['data']['result'] else 0
 
-            # Get memory utilization (if nodes available)
+            # Get memory utilization from kube-state-metrics
             avg_memory = 0.0
             if current_nodes > 0:
-                mem_response = requests.get('http://prometheus:9090/api/v1/query', params={
-                    'query': 'avg(100 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes * 100))'
+                # Calculate memory pressure based on requested vs allocatable memory
+                mem_requests_response = requests.get('http://prometheus:9090/api/v1/query', params={
+                    'query': 'sum(kube_pod_container_resource_requests{resource="memory"})'
                 })
-                avg_memory = float(mem_response.json()['data']['result'][0]['value'][1]) if mem_response.json()['data']['result'] else 0
+                mem_allocatable_response = requests.get('http://prometheus:9090/api/v1/query', params={
+                    'query': 'sum(kube_node_status_allocatable{resource="memory"})'
+                })
+
+                if mem_requests_response.json()['data']['result'] and mem_allocatable_response.json()['data']['result']:
+                    requested = float(mem_requests_response.json()['data']['result'][0]['value'][1])
+                    allocatable = float(mem_allocatable_response.json()['data']['result'][0]['value'][1])
+                    avg_memory = (requested / allocatable) * 100 if allocatable > 0 else 0
+                else:
+                    avg_memory = 20.0  # Default if metrics unavailable
 
             return {
                 'pending_pods': pending_pods,
@@ -259,8 +288,9 @@ class K3sAutoscaler:
                 privileged=True,
                 environment={
                     'K3S_URL': f'https://k3s-master:{api_port}',
-                    'K3S_TOKEN': 'mysupersecrettoken12345',
+                    'K3S_TOKEN': os.getenv('K3S_TOKEN', 'mysupersecrettoken12345'),
                     'K3S_NODE_NAME': new_worker_name,
+                    'K3S_WITH_NODE_ID': 'true',
                     'K3S_KUBECONFIG_OUTPUT': '/output/kubeconfig',
                     'K3S_KUBECONFIG_MODE': '666',
                 },
@@ -355,16 +385,19 @@ class K3sAutoscaler:
     def get_worker_containers(self) -> Dict[str, Dict]:
         """Get all worker containers"""
         try:
-            containers = self.docker_client.containers.list(
-                filters={'label': f'com.docker.compose.service={self.config["autoscaler"]["docker"]["worker_service"]}'}
-            )
+            # Get all containers that start with the worker prefix
+            containers = self.docker_client.containers.list(all=True)
+            worker_containers = [
+                container for container in containers
+                if container.name.startswith(self.worker_prefix) and container.status in ('running', 'exited')
+            ]
             return {
                 container.name: {
                     'container': container,
                     'launched_at': datetime.fromisoformat(container.attrs['Created']) if 'Created' in container.attrs else datetime.now(),
                     'status': container.status
                 }
-                for container in containers
+                for container in worker_containers
             }
         except Exception as e:
             logger.error(f"Failed to get worker containers: {e}")

@@ -2,7 +2,12 @@ FROM python:3.9-slim
 
 WORKDIR /app
 
-# Install dependencies
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    sqlite3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -10,8 +15,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ ./src/
 COPY config/ ./config/
 
-# Create non-root user
-RUN useradd -m -u 1000 autoscaler
+# Create directories for data
+RUN mkdir -p /app/data && \
+    useradd -m -u 1000 autoscaler && \
+    chown -R autoscaler:autoscaler /app
+
 # Keep as root for Docker socket access, will drop privileges in dry run mode
 # USER autoscaler
 

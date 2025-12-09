@@ -46,7 +46,7 @@ services:
         condition: service_healthy
     environment:
       - K3S_URL=https://k3s-master:6443
-      - K3S_TOKEN=mysupersecrettoken12345
+      - K3S_TOKEN=${K3S_TOKEN:-mysupersecrettoken12345}
       - K3S_NODE_NAME=k3s-worker-1
       - K3S_WITH_NODE_ID=true
     volumes:
@@ -183,6 +183,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - CONFIG_PATH=/app/config/config.yaml
+      - K3S_SERVER_HOST=k3s-master
+      - K3S_TOKEN=${K3S_TOKEN:-mysupersecrettoken12345}
     networks:
       - k3s-network
     restart: unless-stopped
