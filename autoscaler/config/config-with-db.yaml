@@ -1,0 +1,58 @@
+# Autoscaler Configuration with Database Support
+autoscaler:
+  check_interval: 5                # Check every 5 seconds
+  dry_run: false                   # Set to false to actually scale containers
+
+  # Kubernetes connection settings
+  kubernetes:
+    in_cluster: false             # Running outside cluster
+    kubeconfig_path: "/config/kubeconfig"
+
+  # Scaling thresholds
+  thresholds:
+    pending_pods: 1               # Scale up when 1+ pods pending
+    cpu_threshold: 80            # Scale up when CPU > 80%
+    memory_threshold: 80         # Scale up when Memory > 80%
+    cpu_scale_down: 30           # Scale down when CPU < 30%
+    memory_scale_down: 30        # Scale down when Memory < 30%
+
+  # Scaling limits
+  limits:
+    min_nodes: 2                 # Minimum number of worker nodes (1 master + 2 workers total)
+    max_nodes: 6                 # Maximum number of nodes (1 master + 5 workers total)
+    scale_up_cooldown: 60        # Wait 60s after scale up
+    scale_down_cooldown: 120     # Wait 2 minutes after scale down
+
+  # Docker management (for adding/removing workers)
+  docker:
+    network: "prototype_k3s-network"  # Docker network name
+    worker_service: "k3s-worker"
+    image: "rancher/k3s:v1.29.1-k3s1"
+    cpu_limit: "1"
+    memory_limit: "2g"
+    api_delay: 3                  # Simulate API delay in seconds
+    boot_time: 30                # Time for new node to be ready
+
+  # Database configuration
+  database:
+    mongodb:
+      url: "mongodb://mongodb:27017"
+      database_name: "autoscaler"
+      connection_timeout: 5
+    redis:
+      host: "redis"
+      port: 6379
+      db: 0
+      password: null
+      connection_timeout: 5
+
+# Logging
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "/app/autoscaler.log"
+
+# Alerting
+alerting:
+  enabled: true
+  webhook_url: "http://alertmanager:9093/api/v1/alerts"

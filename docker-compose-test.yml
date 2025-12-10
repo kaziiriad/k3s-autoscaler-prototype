@@ -1,0 +1,53 @@
+services:
+  # MongoDB for testing
+  mongodb:
+    image: mongo:7.0
+    container_name: mongodb-test
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb-test-data:/data/db
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=admin
+      - MONGO_INITDB_ROOT_PASSWORD=admin123
+      - MONGO_INITDB_DATABASE=autoscaler
+    networks:
+      - test-network
+    restart: unless-stopped
+
+  # Redis for testing
+  redis:
+    image: redis:7.2-alpine
+    container_name: redis-test
+    ports:
+      - "6379:6379"
+    networks:
+      - test-network
+    restart: unless-stopped
+
+  # Test the autoscaler in dry-run mode
+  autoscaler:
+    image: autoscaler-custom:latest
+    container_name: autoscaler-test
+    ports:
+      - "8080:8080"
+      - "9091:9091"
+    depends_on:
+      - mongodb
+      - redis
+    volumes:
+      - ./autoscaler/config:/app/config:ro
+    env_file:
+      - .env
+    environment:
+      - AUTOSCALER_DRY_RUN=true
+    networks:
+      - test-network
+    restart: unless-stopped
+
+networks:
+  test-network:
+    driver: bridge
+
+volumes:
+  mongodb-test-data:
