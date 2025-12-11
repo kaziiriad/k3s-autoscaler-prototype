@@ -1,4 +1,4 @@
-# Autoscaler Configuration
+# Autoscaler Configuration with Database Support
 autoscaler:
   check_interval: 5                # Check every 5 seconds
   dry_run: false                   # Set to false to actually scale containers
@@ -7,6 +7,7 @@ autoscaler:
   kubernetes:
     in_cluster: false             # Running outside cluster
     kubeconfig_path: "/config/kubeconfig"
+    server_host: "k3s-master"
 
   # Scaling thresholds
   thresholds:
@@ -32,6 +33,19 @@ autoscaler:
     memory_limit: "2g"
     api_delay: 3                  # Simulate API delay in seconds
     boot_time: 30                # Time for new node to be ready
+
+  # Database configuration
+  database:
+    mongodb:
+      url: "mongodb://mongodb:27017"
+      database_name: "autoscaler"
+      connection_timeout: 5
+    redis:
+      host: "redis"
+      port: 6379
+      db: 0
+      password: null
+      connection_timeout: 5
 
 # Logging
 logging:

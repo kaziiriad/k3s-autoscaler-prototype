@@ -42,6 +42,9 @@ class K3sAutoscaler:
 
         logger.info("K3s Autoscaler initialized with database support")
 
+        # Sync database with actual cluster state on startup
+        self._sync_database_with_cluster()
+
     def run_cycle(self) -> Dict[str, Any]:
         """
         Run a complete autoscaling cycle
@@ -60,10 +63,14 @@ class K3sAutoscaler:
             decision_result = self.scaling.evaluate_scaling(metrics_data)
 
             # Execute scaling decision
-            if decision_result['should_scale'] and not self.config['autoscaler']['dry_run']:
-                success = self._execute_scaling(decision_result)
+            dry_run_enabled = self.config['autoscaler']['dry_run']
+            logger.info(f"Dry-run mode: {dry_run_enabled}, Should scale: {decision_result.get('should_scale', False)}")
+
+            if decision_result['should_scale'] and not dry_run_enabled:
+                success = self._execute_scaling(decision_result, metrics_data)
                 decision_result['success'] = success
-            elif self.config['autoscaler']['dry_run']:
+            elif dry_run_enabled:
+                logger.info("Dry-run mode: Skipping actual scaling execution")
                 decision_result['dry_run'] = True
                 decision_result['success'] = True
 
@@ -92,7 +99,7 @@ class K3sAutoscaler:
                 "timestamp": datetime.utcnow().isoformat()
             }
 
-    def _execute_scaling(self, decision: Dict[str, Any]) -> bool:
+    def _execute_scaling(self, decision: Dict[str, Any], metrics: Dict[str, Any] = None) -> bool:
         """Execute a scaling decision"""
         action = decision['action']
         count = decision.get('count', 1)
@@ -101,7 +108,7 @@ class K3sAutoscaler:
             if action == "scale_up":
                 return self._scale_up(count, decision)
             elif action == "scale_down":
-                return self._scale_down(count, decision)
+                return self._scale_down(count, decision, metrics)
             else:
                 logger.warning(f"Unknown scaling action: {action}")
                 return False
@@ -113,11 +120,17 @@ class K3sAutoscaler:
         """Scale up by adding worker nodes"""
         logger.info(f"Scaling up by {count} nodes")
 
-        # Check cooldown
+        # Check both cooldowns to prevent rapid oscillation
         if self.database.is_cooldown_active("scale_up"):
             remaining = self.database.get_cooldown_remaining("scale_up")
             logger.info(f"Scale up cooldown active: {remaining}s remaining")
             return False
+
+        # Also check if scale_down is recently active (optional: prevent immediate reverse scaling)
+        # if self.database.is_cooldown_active("scale_down"):
+        #     remaining = self.database.get_cooldown_remaining("scale_down")
+        #     logger.info(f"Recent scale down, waiting: {remaining}s remaining")
+        #     return False
 
         # Add workers
         added = 0
@@ -139,19 +152,31 @@ class K3sAutoscaler:
             logger.warning("No nodes were added during scale up")
             return False
 
-    def _scale_down(self, count: int, decision: Dict[str, Any]) -> bool:
+    def _scale_down(self, count: int, decision: Dict[str, Any], metrics: Dict[str, Any] = None) -> bool:
         """Scale down by removing worker nodes"""
         logger.info(f"Scaling down by {count} nodes")
 
-        # Check cooldown
+        # Check both cooldowns to prevent rapid oscillation
         if self.database.is_cooldown_active("scale_down"):
             remaining = self.database.get_cooldown_remaining("scale_down")
             logger.info(f"Scale down cooldown active: {remaining}s remaining")
             return False
 
-        # Check minimum nodes
-        current_count = self.database.get_worker_count()
+        # CRITICAL: Also check if scale_up is active to prevent immediate reverse scaling
+        if self.database.is_cooldown_active("scale_up"):
+            remaining = self.database.get_cooldown_remaining("scale_up")
+            logger.info(f"Recent scale up, waiting: {remaining}s remaining before scale down")
+            return False
+
+        # Check minimum nodes using actual cluster metrics
+        if metrics:
+            current_count = metrics.get('current_nodes', 0)
+        else:
+            # Fallback to database count (may be out of sync)
+            current_count = self.database.get_worker_count()
+
         min_nodes = self.config['autoscaler']['limits']['min_nodes']
+        logger.info(f"Worker count check: current={current_count}, min={min_nodes}")
         if current_count <= min_nodes:
             logger.info(f"Cannot scale down: at minimum nodes ({min_nodes})")
             return False
@@ -330,3 +355,58 @@ class K3sAutoscaler:
             })
 
         return details
+
+    def _sync_database_with_cluster(self):
+        """Sync database records with actual cluster state"""
+        try:
+            # Get current cluster state
+            metrics_data = self.metrics.collect()
+            actual_nodes = metrics_data.get('current_nodes', 0)
+
+            # Get workers from database
+            db_workers = self.database.get_all_workers()
+            db_node_names = {w.node_name for w in db_workers}
+
+            # Get actual worker containers from Docker
+            if not hasattr(self, 'docker_client'):
+                self.docker_client = docker.from_env()
+                self.docker_client.ping()
+
+            containers = self.docker_client.containers.list(all=True)
+            actual_containers = {}
+            for container in containers:
+                if container.name and container.name.startswith(self.worker_prefix):
+                    actual_containers[container.name] = container
+
+            logger.info(f"Syncing database with cluster: {len(actual_containers)} containers, {len(db_workers)} DB records")
+
+            # Add missing workers to database
+            for container_name, container in actual_containers.items():
+                if container_name not in db_node_names:
+                    worker_node = WorkerNode(
+                        node_name=container_name,
+                        container_id=container.id,
+                        container_name=container_name,
+                        status=NodeStatus.READY if container.status == 'running' else NodeStatus.STOPPED,
+                        launched_at=datetime.utcnow(),
+                        metadata={
+                            "created_by": "docker_compose",
+                            "container_image": container.image.tags[0] if container.image.tags else "unknown",
+                            "network": self.config['autoscaler']['docker']['network'],
+                            "synced_at": datetime.utcnow().isoformat()
+                        }
+                    )
+                    self.database.add_worker(worker_node)
+                    logger.info(f"Added existing worker to database: {container_name}")
+
+            # Mark removed workers as REMOVED in database
+            for worker in db_workers:
+                if worker.node_name not in actual_containers:
+                    self.database.update_worker_status(worker.node_name, NodeStatus.REMOVED)
+                    logger.info(f"Marked worker as REMOVED in database: {worker.node_name}")
+
+            logger.info("Database sync with cluster completed")
+
+        except Exception as e:
+            logger.error(f"Failed to sync database with cluster: {e}")
+            # Don't fail initialization, just log the error

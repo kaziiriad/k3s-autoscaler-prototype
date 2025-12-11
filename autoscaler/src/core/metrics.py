@@ -6,7 +6,7 @@ Metrics collector module for gathering cluster and node metrics
 import logging
 import requests
 from typing import Dict, Any, Optional
-from kubernetes import client, config
+from kubernetes import client, config as k8s_config
 from database import DatabaseManager
 
 logger = logging.getLogger(__name__)
@@ -34,11 +34,30 @@ class MetricsCollector:
         """Initialize Kubernetes API client"""
         try:
             if self.config['autoscaler']['kubernetes']['in_cluster']:
-                config.load_incluster_config()
+                k8s_config.load_incluster_config()
             else:
-                config.load_kube_config(
-                    config_file=self.config['autoscaler']['kubernetes']['kubeconfig_path']
-                )
+                kubeconfig_path = self.config['autoscaler']['kubernetes']['kubeconfig_path']
+                
+                # Load the kubeconfig
+                k8s_config.load_kube_config(config_file=kubeconfig_path)
+                
+                # Override the server host if specified in config
+                server_host = self.config['autoscaler']['kubernetes'].get('server_host')
+                if server_host and server_host != 'localhost' and server_host != '127.0.0.1':
+                    # Get the configuration
+                    configuration = k8s_config.Configuration.get_default_copy()
+                    
+                    # Override the host - replace 127.0.0.1 or localhost with the actual server host
+                    if '127.0.0.1' in configuration.host or 'localhost' in configuration.host:
+                        # Extract the port from the current host
+                        port = configuration.host.split(':')[-1]
+                        # Build new host URL
+                        configuration.host = f"https://{server_host}:{port}"
+                        logger.info(f"Overriding Kubernetes API server to: {configuration.host}")
+                        
+                        # Set the modified configuration
+                        k8s_config.Configuration.set_default(configuration)
+                
             self.k8s_api = client.CoreV1Api()
             logger.info("Kubernetes client initialized")
         except Exception as e:

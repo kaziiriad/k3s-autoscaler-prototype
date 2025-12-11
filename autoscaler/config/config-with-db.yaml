@@ -7,6 +7,7 @@ autoscaler:
   kubernetes:
     in_cluster: false             # Running outside cluster
     kubeconfig_path: "/config/kubeconfig"
+    server_host: "k3s-master"
 
   # Scaling thresholds
   thresholds:

@@ -100,9 +100,10 @@ class WorkerNodeRepository(MongoDBRepository):
 
     def get_active_nodes(self) -> List[WorkerNode]:
         """Get all active nodes (not removed)"""
-        return self.get_all().filter(
-            lambda w: w.status not in [NodeStatus.REMOVED, NodeStatus.ERROR]
-        )
+        return [
+            w for w in self.get_all()
+            if w.status not in [NodeStatus.REMOVED, NodeStatus.ERROR]
+        ]
 
     def get_ready_nodes(self) -> List[WorkerNode]:
         """Get all ready nodes"""
