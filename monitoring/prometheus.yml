@@ -49,25 +49,25 @@ scrape_configs:
       - targets: ['kube-state-metrics:8081']
     scrape_interval: 30s
 
-  # K3s API server metrics (cadvisor)
-  - job_name: 'k3s-cadvisor'
-    kubernetes_sd_configs:
-      - role: node
-        kubeconfig_file: /etc/prometheus/kubeconfig
-    scheme: https
-    tls_config:
-      ca_file: /etc/prometheus/kubeconfig
-      insecure_skip_verify: true
-    bearer_token_file: /etc/prometheus/kubeconfig
-    relabel_configs:
-      - action: labelmap
-        regex: __meta_kubernetes_node_label_(.+)
-      - target_label: __address__
-        replacement: k3s-master:6443
-      - source_labels: [__meta_kubernetes_node_name]
-        regex: (.+)
-        target_label: __metrics_path__
-        replacement: /api/v1/nodes/${1}/proxy/metrics/cadvisor
+  # K3s API server metrics (cadvisor) - disabled due to TLS issues
+  # - job_name: 'k3s-cadvisor'
+  #   kubernetes_sd_configs:
+  #     - role: node
+  #       kubeconfig_file: /etc/prometheus/kubeconfig
+  #   scheme: https
+  #   tls_config:
+  #     ca_file: /etc/prometheus/kubeconfig
+  #     insecure_skip_verify: true
+  #   bearer_token_file: /etc/prometheus/kubeconfig
+  #   relabel_configs:
+  #     - action: labelmap
+  #       regex: __meta_kubernetes_node_label_(.+)
+  #     - target_label: __address__
+  #       replacement: k3s-master:6443
+  #     - source_labels: [__meta_kubernetes_node_name]
+  #       regex: (.+)
+  #       target_label: __metrics_path__
+  #       replacement: /api/v1/nodes/${1}/proxy/metrics/cadvisor
 
   # Autoscaler metrics (if needed later)
   - job_name: 'autoscaler'

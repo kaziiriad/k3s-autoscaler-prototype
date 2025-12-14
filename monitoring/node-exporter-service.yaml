@@ -5,11 +5,13 @@ metadata:
   namespace: kube-system
   labels:
     app.kubernetes.io/name: node-exporter
+    app.kubernetes.io/component: monitoring
 spec:
+  type: ClusterIP
+  ports:
+    - name: metrics
+      port: 9100
+      targetPort: 9100
+      protocol: TCP
   selector:
     app.kubernetes.io/name: node-exporter
-  ports:
-    - name: http
-      port: 9100
-      targetPort: http
-      protocol: TCP
