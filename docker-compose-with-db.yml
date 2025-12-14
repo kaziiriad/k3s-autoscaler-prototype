@@ -1,7 +1,7 @@
 # version: '3.8'  # Removed obsolete version field
 
 services:
-  # K3s M    aster Node
+  # K3s Master Node
   k3s-master:
     image: rancher/k3s:v1.29.1-k3s1
     container_name: k3s-master
@@ -18,6 +18,7 @@ services:
     volumes:
       - k3s-master-data:/var/lib/rancher/k3s
       - ./kubeconfig:/output
+      - ./scripts:/scripts:ro
     command: >
       server
       --https-listen-port=6443
@@ -49,7 +50,7 @@ services:
       - k3s-network
     depends_on:
       - k3s-master
-    restart: unless-stopped
+    restart: "no"
 
   # K3s Worker Nodes
   k3s-worker-1:
@@ -57,21 +58,17 @@ services:
     container_name: k3s-worker-1
     hostname: k3s-worker-1
     privileged: true
-    depends_on:
-      k3s-master:
-        condition: service_healthy
     environment:
       - K3S_URL=https://k3s-master:6443
-      - K3S_NODE_NAME=k3s-worker-1
-      - K3S_WITH_NODE_ID=true
-    env_file:
-      - .env
+      - K3S_TOKEN=mysupersecrettoken12345
     volumes:
       - k3s-worker-1-data:/var/lib/rancher/k3s
-      - ./kubeconfig:/output
     command: agent
     networks:
       - k3s-network
+    depends_on:
+      kubeconfig-fixer:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   k3s-worker-2:
@@ -79,26 +76,22 @@ services:
     container_name: k3s-worker-2
     hostname: k3s-worker-2
     privileged: true
-    depends_on:
-      k3s-master:
-        condition: service_healthy
     environment:
       - K3S_URL=https://k3s-master:6443
-      - K3S_NODE_NAME=k3s-worker-2
-      - K3S_WITH_NODE_ID=true
-    env_file:
-      - .env
+      - K3S_TOKEN=mysupersecrettoken12345
     volumes:
       - k3s-worker-2-data:/var/lib/rancher/k3s
-      - ./kubeconfig:/output
     command: agent
     networks:
       - k3s-network
+    depends_on:
+      kubeconfig-fixer:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   # MongoDB for persistent storage
   mongodb:
-    image: mongo:7.0
+    image: mongo:6.0
     container_name: mongodb
     ports:
       - "27017:27017"
@@ -106,50 +99,110 @@ services:
       - mongodb-data:/data/db
     environment:
       - MONGO_INITDB_ROOT_USERNAME=admin
-      - MONGO_INITDB_ROOT_PASSWORD=admin123
+      - MONGO_INITDB_ROOT_PASSWORD=password
       - MONGO_INITDB_DATABASE=autoscaler
     networks:
       - k3s-network
     restart: unless-stopped
 
-  # Redis for real-time state
+  # Redis for caching and cooldowns
   redis:
-    image: redis:7.2-alpine
+    image: redis:7-alpine
     container_name: redis
     ports:
       - "6379:6379"
     volumes:
       - redis-data:/data
-    command: redis-server --appendonly yes
     networks:
       - k3s-network
     restart: unless-stopped
 
-  # Prometheus Monitoring
+  # Prometheus for metrics collection
   prometheus:
-    image: prom/prometheus:v2.48.0
+    image: prom/prometheus:v2.40.7
     container_name: prometheus
     ports:
       - "9090:9090"
     volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./monitoring/scaling_rules.yml:/etc/prometheus/scaling_rules.yml:ro
-      - ./monitoring/k3s-nodes.yml:/etc/prometheus/k3s-nodes.yml:ro
-      - ./kubeconfig/kubeconfig:/etc/prometheus/kubeconfig:ro
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/scaling_rules.yml:/etc/prometheus/scaling_rules.yml
+      - ./kubeconfig:/etc/prometheus/kubeconfig-ro:ro
       - prometheus-data:/prometheus
-      - /var/run/docker.sock:/var/run/docker.sock:ro
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
-      - '--storage.tsdb.retention.time=7d'
-      - '--web.enable-admin-api'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - k3s-network
+    depends_on:
+      - k3s-master
+      - monitoring-setup
+    restart: unless-stopped
+
+  # AlertManager for alerting
+  alertmanager:
+    image: prom/alertmanager:v0.25.0
+    container_name: alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml
+      - alertmanager-data:/alertmanager
     networks:
       - k3s-network
     restart: unless-stopped
 
-  # Node Exporter for metrics
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/k3s-cluster-dashboard.json:/var/lib/grafana/dashboards/k3s-cluster-dashboard.json:ro
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    networks:
+      - k3s-network
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  # Autoscaler Service
+  autoscaler:
+    build:
+      context: ./autoscaler
+      dockerfile: Dockerfile
+    container_name: autoscaler
+    ports:
+      - "8080:8080"
+      - "9091:9091"
+    volumes:
+      - ./kubeconfig:/app/kubeconfig:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - KUBECONFIG=/app/kubeconfig/kubeconfig
+      - WORKER_PREFIX=k3s-worker
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - MONGODB_URL=mongodb://admin:password@mongodb:27017/autoscaler?authSource=admin
+      - REDIS_URL=redis://redis:6379
+    networks:
+      - k3s-network
+    depends_on:
+      - k3s-master
+      - mongodb
+      - redis
+    restart: unless-stopped
+
+  # Node Exporter for the host
   node-exporter:
-    image: prom/node-exporter:v1.6.1
+    image: prom/node-exporter:latest
     container_name: node-exporter
     ports:
       - "9100:9100"
@@ -166,88 +219,77 @@ services:
       - k3s-network
     restart: unless-stopped
 
+  # Kube-state-metrics
   kube-state-metrics:
     image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.10.0
     container_name: kube-state-metrics
-    ports:
-      - "8081:8081"
-    environment:
-      - KUBECONFIG=/config/kubeconfig
-      - K3S_MASTER_HOST=k3s-master
     volumes:
-      - ./kubeconfig:/config:ro
+      - ./kubeconfig:/kubeconfig:ro
     command:
-      - --kubeconfig=/config/kubeconfig
+      - --kubeconfig=/kubeconfig/kubeconfig
       - --port=8081
       - --telemetry-port=8082
+    ports:
+      - "8081:8081"
+      - "8082:8082"
     networks:
       - k3s-network
     depends_on:
       - k3s-master
     restart: unless-stopped
 
-  # AlertManager
-  alertmanager:
-    image: prom/alertmanager:v0.24.0
-    container_name: alertmanager
-    ports:
-      - "9093:9093"
+  # Monitoring Setup Service - Auto-configures node-exporter DaemonSet
+  monitoring-setup:
+    image: alpine:latest
+    container_name: monitoring-setup
     volumes:
-      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
-    networks:
-      - k3s-network
-    restart: unless-stopped
-
-  # Grafana for visualization
-  grafana:
-    image: grafana/grafana:10.2.0
-    container_name: grafana
-    ports:
-      - "3000:3000"
+      - ./kubeconfig:/workspace/kubeconfig
+      - ./setup_monitoring.sh:/workspace/setup_monitoring.sh:ro
+      - ./monitoring:/workspace/monitoring:ro
     environment:
-      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
-      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/k3s-dashboard.json
-    env_file:
-      - .env
-    volumes:
-      - grafana-data:/var/lib/grafana
-      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./monitoring/grafana/k3s-dashboard.json:/var/lib/grafana/dashboards/k3s-dashboard.json:ro
+      - KUBECONFIG=/workspace/kubeconfig/kubeconfig
+    working_dir: /workspace
+    command:
+      - /bin/sh
+      - -c
+      - |
+        apk add --no-cache curl &&
+        curl -LO https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl &&
+        install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl &&
+
+        echo "Deploying node-exporter DaemonSet..." &&
+        kubectl apply -f ./monitoring/node-exporter-daemonset.yaml --kubeconfig=./kubeconfig/kubeconfig &&
+
+        echo "Deploying node-exporter Service..." &&
+        kubectl apply -f ./monitoring/node-exporter-service.yaml --kubeconfig=./kubeconfig/kubeconfig &&
+
+        echo "Verifying deployments..." &&
+        sleep 5 &&
+
+        NODE_EXPORTER_PODS=$(kubectl get pods -l app=node-exporter -n kube-system --kubeconfig=./kubeconfig/kubeconfig --no-headers | wc -l) &&
+        echo "Node-exporter pods: $NODE_EXPORTER_PODS" &&
+
+        echo "Monitoring setup completed successfully!"
     networks:
       - k3s-network
-    restart: unless-stopped
-
-  # The Autoscaler Service
-  autoscaler:
-    image: autoscaler-custom:latest
-    container_name: autoscaler
-    ports:
-      - "8080:8080"
-      - "9091:9091"
     depends_on:
-      - prometheus
-      - mongodb
-      - redis
-    volumes:
-      - ./autoscaler/config:/app/config:ro
-      - ./kubeconfig:/config:ro
-      - /var/run/docker.sock:/var/run/docker.sock
-    env_file:
-      - ./.env
-      
-    networks:
-      - k3s-network
-    restart: unless-stopped
-
-networks:
-  k3s-network:
-    driver: bridge
+      kubeconfig-fixer:
+        condition: service_completed_successfully
+    restart: "no"
 
 volumes:
   k3s-master-data:
   k3s-worker-1-data:
   k3s-worker-2-data:
-  prometheus-data:
-  grafana-data:
   mongodb-data:
   redis-data:
+  prometheus-data:
+  grafana-data:
+  alertmanager-data:
+
+networks:
+  k3s-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
