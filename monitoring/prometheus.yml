@@ -6,14 +6,21 @@ rule_files:
   - "scaling_rules.yml"
 
 scrape_configs:
+  # Prometheus itself
   - job_name: 'prometheus'
     static_configs:
       - targets: ['localhost:9090']
 
+  # Host machine node-exporter (Docker host)
   - job_name: 'node-exporter-host'
     static_configs:
       - targets: ['node-exporter:9100']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: 'docker-host'
 
+  # K3s cluster nodes node-exporter (from DaemonSet)
   - job_name: 'node-exporter-k3s-nodes'
     kubernetes_sd_configs:
       - role: endpoints
@@ -22,99 +29,47 @@ scrape_configs:
           names:
           - kube-system
     relabel_configs:
+      # Keep only node-exporter service endpoints
       - source_labels: [__meta_kubernetes_service_name]
         action: keep
         regex: node-exporter
+      # Add node label from Kubernetes metadata
       - source_labels: [__meta_kubernetes_endpoint_node_name]
         target_label: node
-      - source_labels: [__meta_kubernetes_endpoint_address_target_name]
+      # Set instance label to node name for clarity
+      - source_labels: [__meta_kubernetes_endpoint_node_name]
         target_label: instance
-        regex: '(.+)'
-        replacement: '${1}'
+      # Add namespace label
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: kubernetes_namespace
 
+  # Kube-state-metrics for Kubernetes object metrics
   - job_name: 'kube-state-metrics'
     static_configs:
       - targets: ['kube-state-metrics:8081']
     scrape_interval: 30s
 
-  - job_name: 'k3s-nodes'
+  # K3s API server metrics (cadvisor)
+  - job_name: 'k3s-cadvisor'
     kubernetes_sd_configs:
       - role: node
         kubeconfig_file: /etc/prometheus/kubeconfig
+    scheme: https
+    tls_config:
+      ca_file: /etc/prometheus/kubeconfig
+      insecure_skip_verify: true
+    bearer_token_file: /etc/prometheus/kubeconfig
     relabel_configs:
-      - source_labels: [__address__]
-        regex: '(.*):10250'
-        target_label: __address__
-        replacement: 'k3s-master:6443'
-      - source_labels: [__meta_kubernetes_node_name]
-        regex: '(.+)'
-        target_label: __metrics_path__
-        replacement: '/metrics/cadvisor'
       - action: labelmap
         regex: __meta_kubernetes_node_label_(.+)
-        replacement: '$1'
-        target_label: '$1'
-
-  - job_name: 'k3s-pods'
-    kubernetes_sd_configs:
-      - role: pod
-        kubeconfig_file: /etc/prometheus/kubeconfig
-    relabel_configs:
-      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
-        action: keep
-        regex: true
-      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
-        action: replace
-        target_label: __metrics_path__
+      - target_label: __address__
+        replacement: k3s-master:6443
+      - source_labels: [__meta_kubernetes_node_name]
         regex: (.+)
-      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
-        action: replace
-        regex: ([^:]+)(?::\d+)?;(\d+)
-        replacement: $1:$2
-        target_label: __address__
-      - action: labelmap
-        regex: __meta_kubernetes_pod_label_(.+)
-        replacement: $1
-        target_label: $1
-      - action: labelmap
-        regex: __meta_kubernetes_namespace
-        replacement: kubernetes_namespace
-        target_label: kubernetes_namespace
-      - action: labelmap
-        regex: __meta_kubernetes_pod_name
-        replacement: kubernetes_pod_name
-        target_label: kubernetes_pod_name
-
-  - job_name: 'k3s-services'
-    kubernetes_sd_configs:
-      - role: service
-        kubeconfig_file: /etc/prometheus/kubeconfig
-    relabel_configs:
-      - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
-        action: keep
-        regex: true
-      - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_path]
-        action: replace
         target_label: __metrics_path__
-        regex: (.+)
-      - source_labels: [__address__, __meta_kubernetes_service_annotation_prometheus_io_port]
-        action: replace
-        regex: ([^:]+)(?::\d+)?;(\d+)
-        replacement: $1:$2
-        target_label: __address__
-      - action: labelmap
-        regex: __meta_kubernetes_service_label_(.+)
-        replacement: $1
-        target_label: $1
-      - action: labelmap
-        regex: __meta_kubernetes_namespace
-        replacement: kubernetes_namespace
-        target_label: kubernetes_namespace
-      - action: labelmap
-        regex: __meta_kubernetes_service_name
-        replacement: kubernetes_service_name
-        target_label: kubernetes_service_name
+        replacement: /api/v1/nodes/${1}/proxy/metrics/cadvisor
 
+  # Autoscaler metrics (if needed later)
   - job_name: 'autoscaler'
     static_configs:
       - targets: ['autoscaler:9091']
