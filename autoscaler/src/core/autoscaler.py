@@ -55,9 +55,9 @@ class K3sAutoscaler:
         try:
             # Collect metrics
             metrics_data = self.metrics.collect()
-            logger.info(f"Collected metrics: {metrics_data['current_nodes']} nodes, "
-                       f"{metrics_data['pending_pods']} pending, "
-                       f"CPU: {metrics_data['avg_cpu']:.1f}%, Memory: {metrics_data['avg_memory']:.1f}%")
+            logger.info(f"Collected metrics: {metrics_data.current_nodes} nodes, "
+                       f"{metrics_data.pending_pods} pending, "
+                       f"CPU: {metrics_data.avg_cpu:.1f}%, Memory: {metrics_data.avg_memory:.1f}%")
 
             # Make scaling decision
             decision_result = self.scaling.evaluate_scaling(metrics_data)
@@ -170,7 +170,7 @@ class K3sAutoscaler:
 
         # Check minimum nodes using actual cluster metrics
         if metrics:
-            current_count = metrics.get('current_nodes', 0)
+            current_count = metrics.current_nodes if hasattr(metrics, 'current_nodes') else 0
         else:
             # Fallback to database count (may be out of sync)
             current_count = self.database.get_worker_count()
@@ -279,14 +279,15 @@ class K3sAutoscaler:
             logger.error(f"Failed to create worker node: {e}")
             return None
 
-    def _update_state(self, metrics: Dict[str, Any], decision: Dict[str, Any]):
+    def _update_state(self, metrics: Any, decision: Dict[str, Any]):
         """Update cluster state in database"""
-        # Update metrics cache
-        self.database.cache_metrics(metrics)
-
         # Update Prometheus metrics if configured
         if hasattr(self, 'prometheus_metrics'):
-            self.prometheus_metrics.update(metrics)
+            # Convert Pydantic model to dict if needed
+            if hasattr(metrics, 'dict'):
+                self.prometheus_metrics.update(metrics.dict())
+            else:
+                self.prometheus_metrics.update(metrics)
 
     def get_status(self) -> Dict[str, Any]:
         """Get current autoscaler status"""
@@ -361,7 +362,7 @@ class K3sAutoscaler:
         try:
             # Get current cluster state
             metrics_data = self.metrics.collect()
-            actual_nodes = metrics_data.get('current_nodes', 0)
+            actual_nodes = metrics_data.current_nodes
 
             # Get workers from database
             db_workers = self.database.get_all_workers()

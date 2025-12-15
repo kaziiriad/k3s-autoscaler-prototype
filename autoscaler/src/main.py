@@ -16,36 +16,14 @@ from datetime import datetime
 # Add src to path for absolute imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Import centralized logging
+from core.logging_config import setup_logging, get_logger
+
 # Import modular components
 from core.autoscaler import K3sAutoscaler
 from database import DatabaseManager
 from api.server import APIServer
 from config import Settings, settings
-
-# Configure logging
-def setup_logging(log_config: Dict):
-    """Setup logging configuration"""
-    log_level = log_config.get('level', 'INFO')
-    log_format = log_config.get('format', '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    log_file = log_config.get('file')
-
-    handlers = [logging.StreamHandler(sys.stdout)]
-    if log_file:
-        try:
-            # Try to create the file handler, but don't fail if we can't
-            handlers.append(logging.FileHandler(log_file))
-        except (PermissionError, OSError):
-            # If we can't write to the file, just continue without it
-            pass
-
-    logging.basicConfig(
-        level=getattr(logging, log_level.upper()),
-        format=log_format,
-        handlers=handlers,
-        force=True  # Reconfigure even if already configured
-    )
-
-    return logging.getLogger(__name__)
 
 # Prometheus metrics
 SCALING_DECISIONS = Counter('autoscaler_scaling_decisions_total', 'Total scaling decisions', ['decision'])
@@ -71,7 +49,12 @@ class AutoscalerService:
         self.config = self.settings.get_config_dict()
 
         # Setup logging
-        self.logger = setup_logging(self.config.get('logging', {}))
+        setup_logging(
+            level=self.config.get('logging', {}).get('level', 'INFO'),
+            log_file=self.config.get('logging', {}).get('file', '/app/logs/autoscaler.log'),
+            enable_colors=True
+        )
+        self.logger = get_logger(__name__)
         self.running = True
 
         # Initialize database manager

@@ -192,6 +192,7 @@ services:
       - DOCKER_HOST=unix:///var/run/docker.sock
       - MONGODB_URL=mongodb://admin:password@mongodb:27017/autoscaler?authSource=admin
       - REDIS_URL=redis://redis:6379
+      - REDIS_HOST=redis
     networks:
       - k3s-network
     depends_on:

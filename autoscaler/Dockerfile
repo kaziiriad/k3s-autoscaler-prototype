@@ -12,8 +12,16 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     curl \
     gosu \
+    apt-transport-https \
+    ca-certificates \
+    gnupg \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
+
+# Install kubectl for debugging
+RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
+    && chmod +x kubectl \
+    && mv kubectl /usr/local/bin/
 
 # Create non-root user (for security when not using Docker socket)
 RUN groupadd -r autoscaler && useradd -r -g autoscaler autoscaler

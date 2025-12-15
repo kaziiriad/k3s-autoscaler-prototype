@@ -8,11 +8,11 @@ from typing import Optional, Dict, Any
 
 # Try Pydantic v2 first, fallback to v1
 try:
-    from pydantic import Field, validator
+    from pydantic import Field
     from pydantic_settings import BaseSettings
 except ImportError:
     # Fallback to Pydantic v1
-    from pydantic.v1 import BaseSettings, Field, validator
+    from pydantic.v1 import BaseSettings, Field
 
 # Load environment variables from .env file if it exists
 try:
@@ -23,110 +23,115 @@ except ImportError:
 
 class MongoDBSettings(BaseSettings):
     """MongoDB configuration settings"""
-    url: str = Field(default="mongodb://localhost:27017", env="MONGODB_URL")
-    database_name: str = Field(default="autoscaler", env="MONGODB_DATABASE_NAME")
-    connection_timeout: int = Field(default=5, env="MONGODB_CONNECTION_TIMEOUT")
+    url: str = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
+    database_name: str = os.getenv("MONGODB_DATABASE_NAME", "autoscaler")
+    connection_timeout: int = int(os.getenv("MONGODB_CONNECTION_TIMEOUT", "5"))
 
-    model_config = {"env_prefix": "MONGODB_", "extra": "ignore"}
+    class Config:
+        extra = "ignore"
 
 
 class RedisSettings(BaseSettings):
     """Redis configuration settings"""
-    host: str = Field(default="localhost", env="REDIS_HOST")
-    port: int = Field(default=6379, env="REDIS_PORT")
-    db: int = Field(default=0, env="REDIS_DB")
-    password: Optional[str] = Field(default=None, env="REDIS_PASSWORD")
-    connection_timeout: int = Field(default=5, env="REDIS_CONNECTION_TIMEOUT")
+    host: str = os.getenv("REDIS_HOST", "localhost")
+    port: int = int(os.getenv("REDIS_PORT", "6379"))
+    db: int = int(os.getenv("REDIS_DB", "0"))
+    password: Optional[str] = os.getenv("REDIS_PASSWORD", None)
+    connection_timeout: int = int(os.getenv("REDIS_CONNECTION_TIMEOUT", "5"))
 
-    model_config = {"env_prefix": "REDIS_", "extra": "ignore"}
+    class Config:
+        extra = "ignore"
 
 
 class KubernetesSettings(BaseSettings):
     """Kubernetes configuration settings"""
-    in_cluster: bool = Field(default=False, env="KUBERNETES_IN_CLUSTER")
-    kubeconfig_path: str = Field(default="/config/kubeconfig", env="KUBECONFIG_PATH")
-    server_host: Optional[str] = Field(default=None, env="K3S_SERVER_HOST")
+    in_cluster: bool = os.getenv("KUBERNETES_IN_CLUSTER", "false").lower() == "true"
+    kubeconfig_path: str = os.getenv("KUBECONFIG_PATH", "/app/kubeconfig/kubeconfig")
+    server_host: Optional[str] = os.getenv("K3S_SERVER_HOST")
 
-    model_config = {"env_prefix": "KUBERNETES_", "extra": "ignore"}
+    class Config:
+        extra = "ignore"
 
 
 class DockerSettings(BaseSettings):
     """Docker configuration settings"""
-    network: str = Field(default="prototype_k3s-network", env="DOCKER_NETWORK")
-    worker_service: str = Field(default="k3s-worker", env="DOCKER_WORKER_SERVICE")
-    image: str = Field(default="rancher/k3s:v1.29.1-k3s1", env="DOCKER_IMAGE")
-    cpu_limit: str = Field(default="1", env="DOCKER_CPU_LIMIT")
-    memory_limit: str = Field(default="2g", env="DOCKER_MEMORY_LIMIT")
-    api_delay: int = Field(default=3, env="DOCKER_API_DELAY")
-    boot_time: int = Field(default=30, env="DOCKER_BOOT_TIME")
+    network: str = os.getenv("DOCKER_NETWORK", "prototype_k3s-network")
+    worker_service: str = os.getenv("DOCKER_WORKER_SERVICE", "k3s-worker")
+    image: str = os.getenv("DOCKER_IMAGE", "rancher/k3s:v1.29.1-k3s1")
+    cpu_limit: str = os.getenv("DOCKER_CPU_LIMIT", "1")
+    memory_limit: str = os.getenv("DOCKER_MEMORY_LIMIT", "2g")
+    api_delay: int = int(os.getenv("DOCKER_API_DELAY", "3"))
+    boot_time: int = int(os.getenv("DOCKER_BOOT_TIME", "30"))
 
-    model_config = {"env_prefix": "DOCKER_", "extra": "ignore"}
+    class Config:
+        extra = "ignore"
 
 
 class AutoscalerSettings(BaseSettings):
     """Main autoscaler configuration settings"""
-    check_interval: int = Field(default=5, env="AUTOSCALER_CHECK_INTERVAL")
-    dry_run: bool = Field(default=False, env="AUTOSCALER_DRY_RUN")
+    check_interval: int = int(os.getenv("AUTOSCALER_CHECK_INTERVAL", "5"))
+    dry_run: bool = os.getenv("AUTOSCALER_DRY_RUN", "false").lower() == "true"
 
     # API settings
-    api_host: str = Field(default="0.0.0.0", env="AUTOSCALER_API_HOST")
-    api_port: int = Field(default=8080, env="AUTOSCALER_API_PORT")
-    metrics_port: int = Field(default=9091, env="AUTOSCALER_METRICS_PORT")
+    api_host: str = os.getenv("AUTOSCALER_API_HOST", "0.0.0.0")
+    api_port: int = int(os.getenv("AUTOSCALER_API_PORT", "8080"))
+    metrics_port: int = int(os.getenv("AUTOSCALER_METRICS_PORT", "9091"))
 
     # Threshold settings
-    pending_pods_threshold: int = Field(default=1, env="AUTOSCALER_PENDING_PODS_THRESHOLD")
-    cpu_threshold_up: float = Field(default=80.0, env="AUTOSCALER_CPU_THRESHOLD_UP")
-    memory_threshold_up: float = Field(default=80.0, env="AUTOSCALER_MEMORY_THRESHOLD_UP")
-    cpu_threshold_down: float = Field(default=30.0, env="AUTOSCALER_CPU_THRESHOLD_DOWN")
-    memory_threshold_down: float = Field(default=30.0, env="AUTOSCALER_MEMORY_THRESHOLD_DOWN")
+    pending_pods_threshold: int = int(os.getenv("AUTOSCALER_PENDING_PODS_THRESHOLD", "1"))
+    cpu_threshold_up: float = float(os.getenv("AUTOSCALER_CPU_THRESHOLD_UP", "80.0"))
+    memory_threshold_up: float = float(os.getenv("AUTOSCALER_MEMORY_THRESHOLD_UP", "80.0"))
+    cpu_threshold_down: float = float(os.getenv("AUTOSCALER_CPU_THRESHOLD_DOWN", "30.0"))
+    memory_threshold_down: float = float(os.getenv("AUTOSCALER_MEMORY_THRESHOLD_DOWN", "30.0"))
 
     # Limit settings
-    min_nodes: int = Field(default=2, env="AUTOSCALER_MIN_NODES")
-    max_nodes: int = Field(default=6, env="AUTOSCALER_MAX_NODES")
-    scale_up_cooldown: int = Field(default=60, env="AUTOSCALER_SCALE_UP_COOLDOWN")
-    scale_down_cooldown: int = Field(default=120, env="AUTOSCALER_SCALE_DOWN_COOLDOWN")
+    min_nodes: int = int(os.getenv("AUTOSCALER_MIN_NODES", "2"))
+    max_nodes: int = int(os.getenv("AUTOSCALER_MAX_NODES", "6"))
+    scale_up_cooldown: int = int(os.getenv("AUTOSCALER_SCALE_UP_COOLDOWN", "60"))
+    scale_down_cooldown: int = int(os.getenv("AUTOSCALER_SCALE_DOWN_COOLDOWN", "120"))
 
     # Token
-    k3s_token: str = Field(default="mysupersecrettoken12345", env="K3S_TOKEN")
+    k3s_token: str = os.getenv("K3S_TOKEN", "mysupersecrettoken12345")
 
-    model_config = {
-        "env_prefix": "AUTOSCALER_",
-        "extra": "ignore"  # Allow extra fields from YAML config
-    }
+    class Config:
+        extra = "ignore"
 
 
 class LoggingSettings(BaseSettings):
     """Logging configuration settings"""
-    level: str = Field(default="INFO", env="LOG_LEVEL")
-    format: str = Field(
-        default="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        env="LOG_FORMAT"
+    level: str = os.getenv("LOG_LEVEL", "INFO")
+    format: str = os.getenv(
+        "LOG_FORMAT",
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
-    file: Optional[str] = Field(default=None, env="LOG_FILE")
+    file: Optional[str] = os.getenv("LOG_FILE", None)
 
-    model_config = {"env_prefix": "LOG_"}
+    class Config:
+        extra = "ignore"
 
 
 class PrometheusSettings(BaseSettings):
     """Prometheus configuration settings"""
-    url: str = Field(default="http://prometheus:9090", env="PROMETHEUS_URL")
-    query_timeout: int = Field(default=5, env="PROMETHEUS_QUERY_TIMEOUT")
+    url: str = os.getenv("PROMETHEUS_URL", "http://prometheus:9090")
+    query_timeout: int = int(os.getenv("PROMETHEUS_QUERY_TIMEOUT", "5"))
 
-    model_config = {"env_prefix": "PROMETHEUS_"}
+    class Config:
+        extra = "ignore"
 
 
 class GrafanaSettings(BaseSettings):
     """Grafana configuration settings"""
-    admin_password: str = Field(default="admin", env="GF_SECURITY_ADMIN_PASSWORD")
+    admin_password: str = os.getenv("GF_SECURITY_ADMIN_PASSWORD", "admin")
 
-    model_config = {"env_prefix": "GF_"}
+    class Config:
+        extra = "ignore"
 
 
 class Settings(BaseSettings):
     """Main settings class that includes all sub-settings"""
     # Environment
-    environment: str = Field(default="development", env="ENVIRONMENT")
-    debug: bool = Field(default=False, env="DEBUG")
+    environment: str = os.getenv("ENVIRONMENT", "development")
+    debug: bool = os.getenv("DEBUG", "false").lower() == "true"
 
     # Component settings
     mongodb: MongoDBSettings = Field(default_factory=MongoDBSettings)
@@ -138,12 +143,11 @@ class Settings(BaseSettings):
     prometheus: PrometheusSettings = Field(default_factory=PrometheusSettings)
     grafana: GrafanaSettings = Field(default_factory=GrafanaSettings)
 
-    model_config = {
-        "env_file": ".env",
-        "env_file_encoding": "utf-8",
-        "case_sensitive": False,
-        "extra": "ignore"  # Allow extra fields to avoid validation errors
-    }
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        case_sensitive = False
+        extra = "ignore"  # Allow extra fields to avoid validation errors
 
     def get_config_dict(self) -> Dict[str, Any]:
         """Convert settings to a dictionary format compatible with the existing autoscaler"""

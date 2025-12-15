@@ -6,7 +6,7 @@ autoscaler:
   # Kubernetes connection settings
   kubernetes:
     in_cluster: false             # Running outside cluster
-    kubeconfig_path: "/config/kubeconfig"
+    kubeconfig_path: "/app/kubeconfig/kubeconfig"
     server_host: "k3s-master"
 
   # Scaling thresholds

@@ -111,9 +111,26 @@ class APIServer:
             """Get current cluster metrics"""
             try:
                 metrics_data = self.autoscaler.metrics.collect()
-                return metrics_data
+                # Pydantic models will be automatically converted to JSON
+                return metrics_data.dict()
             except Exception as e:
                 logger.error(f"Error getting metrics: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.get("/nodes/metrics")
+        async def get_node_metrics():
+            """Get individual node metrics"""
+            try:
+                node_metrics = self.autoscaler.metrics.get_node_metrics()
+                # Convert NodeMetrics objects to dictionaries
+                nodes_dict = {name: metrics.dict() for name, metrics in node_metrics.items()}
+                return {
+                    "nodes": nodes_dict,
+                    "count": len(node_metrics),
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+            except Exception as e:
+                logger.error(f"Error getting node metrics: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
 
         @self.app.get("/workers")
