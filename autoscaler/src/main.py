@@ -149,6 +149,10 @@ class AutoscalerService:
         interval = self.config['autoscaler']['check_interval']
         self.logger.info(f"Starting autoscaling loop with {interval}s interval")
 
+        # Track cleanup cycles
+        cleanup_counter = 0
+        cleanup_interval = 60  # Run cleanup every 60 cycles (5 minutes if interval=5s)
+
         while self.running:
             try:
                 # Run autoscaling cycle
@@ -168,6 +172,15 @@ class AutoscalerService:
                 else:
                     self.logger.error(f"Autoscaling cycle error: {result['error']}")
                     ERRORS.labels(type='autoscaling_cycle').inc()
+
+                # Periodic cleanup of orphaned nodes
+                cleanup_counter += 1
+                if cleanup_counter >= cleanup_interval:
+                    self.logger.info("Running periodic cleanup of orphaned Kubernetes nodes...")
+                    cleanup_result = self.autoscaler.cleanup_orphaned_nodes()
+                    if cleanup_result['cleaned_nodes']:
+                        self.logger.info(f"Cleaned {len(cleanup_result['cleaned_nodes'])} orphaned nodes")
+                    cleanup_counter = 0
 
             except Exception as e:
                 self.logger.error(f"Unexpected error in autoscaling loop: {e}")

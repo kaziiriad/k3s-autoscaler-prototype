@@ -223,6 +223,23 @@ class APIServer:
                 logger.error(f"Error triggering cycle: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
 
+        @self.app.post("/cleanup")
+        async def cleanup_orphaned_nodes():
+            """Clean up orphaned Kubernetes nodes"""
+            try:
+                result = self.autoscaler.cleanup_orphaned_nodes()
+
+                return {
+                    "message": "Orphaned node cleanup completed",
+                    "orphaned_nodes": result["orphaned_nodes"],
+                    "cleaned_nodes": result["cleaned_nodes"],
+                    "errors": result["errors"],
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+            except Exception as e:
+                logger.error(f"Error in cleanup: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
         @self.app.get("/rules")
         async def get_scaling_rules():
             """Get scaling rules"""

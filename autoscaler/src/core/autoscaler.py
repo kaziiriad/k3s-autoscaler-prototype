@@ -223,17 +223,62 @@ class K3sAutoscaler:
             logger.info(f"Recent scale up, waiting: {remaining}s remaining before scale down")
             return False
 
-        # Check minimum nodes using actual cluster metrics
-        if metrics:
-            current_count = metrics.current_nodes if hasattr(metrics, 'current_nodes') else 0
-        else:
-            # Fallback to database count (may be out of sync)
-            current_count = self.database.get_worker_count()
-
+        # Get actual Kubernetes node count to make accurate minimum node decisions
+        actual_k8s_nodes = 0
+        actual_docker_nodes = 0
+        db_workers = self.database.get_all_workers()
         min_nodes = self.config['autoscaler']['limits']['min_nodes']
-        logger.info(f"Worker count check: current={current_count}, min={min_nodes}")
-        if current_count <= min_nodes:
-            logger.info(f"Cannot scale down: at minimum nodes ({min_nodes})")
+
+        # Get Docker container count for workers
+        if not hasattr(self, 'docker_client'):
+            self.docker_client = docker.from_env()
+
+        try:
+            containers = self.docker_client.containers.list(all=True)
+            actual_docker_nodes = len([c for c in containers
+                                     if c.name and c.name.startswith(self.worker_prefix)])
+            logger.info(f"Actual Docker worker containers: {actual_docker_nodes}")
+        except Exception as e:
+            logger.warning(f"Could not get Docker container count: {e}")
+
+        # Count actual Kubernetes nodes
+        if hasattr(self.metrics, 'k8s_api') and self.metrics.k8s_api:
+            try:
+                k8s_nodes = self.metrics.k8s_api.list_node()
+                actual_k8s_nodes = len([n for n in k8s_nodes.items
+                                      if not n.metadata.labels.get('node-role.kubernetes.io/control-plane')])
+                logger.info(f"Actual Kubernetes nodes: {actual_k8s_nodes}")
+
+                # Cross-validate counts
+                if abs(actual_k8s_nodes - actual_docker_nodes) > 1:
+                    logger.warning(f"Node count mismatch: K8s={actual_k8s_nodes}, Docker={actual_docker_nodes}")
+                    # Use the lower count for safety
+                    actual_nodes = min(actual_k8s_nodes, actual_docker_nodes)
+                else:
+                    actual_nodes = actual_k8s_nodes
+
+            except Exception as e:
+                logger.warning(f"Could not get Kubernetes node count: {e}")
+                # Fallback to Docker count
+                actual_nodes = actual_docker_nodes
+        else:
+            # Fallback to Docker count
+            actual_nodes = actual_docker_nodes
+            logger.warning("Kubernetes API not available, using Docker count for node detection")
+
+        # Check minimum nodes against validated node count
+        logger.info(f"Node count check: k8s_nodes={actual_k8s_nodes}, docker={actual_docker_nodes}, actual={actual_nodes}, db_workers={len(db_workers)}, min={min_nodes}")
+
+        # Simple minimum check: allow scaling down to exactly min_nodes
+        if actual_nodes <= min_nodes:
+            logger.info(f"Cannot scale down: at minimum nodes (current={actual_nodes}, min={min_nodes})")
+            return False
+
+        # Emergency stop: only trigger if we're about to violate minimum
+        # This is just an extra safety check
+        if actual_nodes - count < min_nodes:
+            logger.error(f"EMERGENCY STOP: Cannot remove {count} nodes, would go below minimum (current={actual_nodes}, min={min_nodes})")
+            logger.error("Manual intervention required - cluster at minimum capacity")
             return False
 
         # Get workers (most recently launched first)
@@ -406,15 +451,20 @@ class K3sAutoscaler:
             logger.info(f"Draining Kubernetes node: {node_name}")
 
             # 1. Mark the node as unschedulable
-            node = self.metrics.k8s_api.read_node(name=node_name)
+            try:
+                node = self.metrics.k8s_api.read_node(name=node_name)
 
-            # Create a patch to mark as unschedulable
-            patch_body = {
-                "spec": {
-                    "unschedulable": True
+                # Create a patch to mark as unschedulable
+                patch_body = {
+                    "spec": {
+                        "unschedulable": True
+                    }
                 }
-            }
-            self.metrics.k8s_api.patch_node(name=node_name, body=patch_body)
+                self.metrics.k8s_api.patch_node(name=node_name, body=patch_body)
+                logger.info(f"Marked node {node_name} as unschedulable")
+            except Exception as e:
+                logger.warning(f"Could not mark node {node_name} as unschedulable: {e}")
+                # Continue with eviction anyway
 
             # 2. Evict all pods from the node (except system pods)
             pods = self.metrics.k8s_api.list_pod_for_all_namespaces(
@@ -423,9 +473,13 @@ class K3sAutoscaler:
 
             evicted_count = 0
             for pod in pods.items:
-                # Skip system pods
+                # Skip system pods and daemonsets
                 if pod.metadata.namespace in ["kube-system", "kube-public"]:
                     continue
+                if pod.metadata.owner_references:
+                    for owner in pod.metadata.owner_references:
+                        if owner.kind == "DaemonSet":
+                            continue
 
                 try:
                     # Use eviction API to gracefully evict pods
@@ -447,6 +501,21 @@ class K3sAutoscaler:
                 except Exception as e:
                     # If eviction fails, log but continue
                     logger.debug(f"Could not evict pod {pod.metadata.name}: {e}")
+
+            # 3. Force delete the node from Kubernetes
+            try:
+                logger.info(f"Deleting node {node_name} from Kubernetes...")
+                self.metrics.k8s_api.delete_node(
+                    name=node_name,
+                    body=k8s_client.V1DeleteOptions(
+                        grace_period_seconds=0,
+                        propagation_policy='Background'
+                    )
+                )
+                logger.info(f"Initiated node deletion: {node_name}")
+            except Exception as e:
+                logger.error(f"Failed to delete node {node_name}: {e}")
+                # Continue anyway - the container will be removed
 
             logger.info(f"Successfully drained Kubernetes node: {node_name} (evicted {evicted_count} pods)")
             return True
@@ -623,6 +692,65 @@ class K3sAutoscaler:
             logger.info("Autoscaler cleanup completed")
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
+
+    def cleanup_orphaned_nodes(self) -> Dict[str, Any]:
+        """Clean up orphaned Kubernetes nodes that don't have corresponding containers"""
+        cleanup_result = {
+            "orphaned_nodes": [],
+            "cleaned_nodes": [],
+            "errors": []
+        }
+
+        if not hasattr(self.metrics, 'k8s_api') or not self.metrics.k8s_api:
+            logger.warning("Kubernetes API not available, skipping orphaned node cleanup")
+            return cleanup_result
+
+        try:
+            # Get all Kubernetes nodes (excluding control plane)
+            k8s_nodes = self.metrics.k8s_api.list_node()
+            worker_nodes = [n for n in k8s_nodes.items
+                          if not n.metadata.labels.get('node-role.kubernetes.io/control-plane')]
+
+            # Get all Docker containers
+            if not hasattr(self, 'docker_client'):
+                self.docker_client = docker.from_env()
+
+            containers = self.docker_client.containers.list(all=True)
+            container_names = {c.name for c in containers if c.name and c.name.startswith(self.worker_prefix)}
+
+            # Find orphaned nodes (K8s nodes without Docker containers)
+            for node in worker_nodes:
+                node_name = node.metadata.name
+                if node_name not in container_names:
+                    cleanup_result["orphaned_nodes"].append(node_name)
+                    logger.warning(f"Found orphaned Kubernetes node: {node_name}")
+
+                    # Force delete the orphaned node
+                    try:
+                        logger.info(f"Force deleting orphaned node: {node_name}")
+                        self.metrics.k8s_api.delete_node(
+                            name=node_name,
+                            body={
+                                "gracePeriodSeconds": 0,
+                                "propagationPolicy": "Background"
+                            }
+                        )
+                        cleanup_result["cleaned_nodes"].append(node_name)
+                        logger.info(f"Successfully deleted orphaned node: {node_name}")
+                    except Exception as e:
+                        error_msg = f"Failed to delete orphaned node {node_name}: {e}"
+                        cleanup_result["errors"].append(error_msg)
+                        logger.error(error_msg)
+
+            if cleanup_result["cleaned_nodes"]:
+                logger.info(f"Cleaned up {len(cleanup_result['cleaned_nodes'])} orphaned Kubernetes nodes")
+
+        except Exception as e:
+            error_msg = f"Error during orphaned node cleanup: {e}"
+            cleanup_result["errors"].append(error_msg)
+            logger.error(error_msg)
+
+        return cleanup_result
 
     def get_scaling_history(self, limit: int = 50) -> List[Dict]:
         """Get recent scaling history"""
