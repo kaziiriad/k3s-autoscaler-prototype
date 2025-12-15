@@ -87,14 +87,31 @@ class ScalingEngine:
                     # Log scaling decision
                     logger.info(f"Scaling decision: {decision['action']} by {decision['count']} nodes - {decision['reason']}")
 
-                    # Record decision in database
+                    # Record decision in database (without storing full metrics)
                     event_type = ScalingEventType.SCALE_UP if rule.scale_direction == "up" else ScalingEventType.SCALE_DOWN
+                    # Only store essential metrics summary, not the full object
+                    metrics_summary = {}
+                    if hasattr(metrics, 'current_nodes'):
+                        metrics_summary = {
+                            "nodes": metrics.current_nodes,
+                            "cpu": metrics.avg_cpu,
+                            "memory": metrics.avg_memory,
+                            "pending_pods": metrics.pending_pods
+                        }
+                    else:
+                        metrics_summary = {
+                            "nodes": metrics.get("current_nodes", 0),
+                            "cpu": metrics.get("avg_cpu", 0),
+                            "memory": metrics.get("avg_memory", 0),
+                            "pending_pods": metrics.get("pending_pods", 0)
+                        }
+
                     self.database.record_scaling_event(
                         event_type=event_type,
                         old_count=current_nodes,
                         new_count=current_nodes + (rule.scale_amount if rule.scale_direction == "up" else -rule.scale_amount),
                         reason=decision["reason"],
-                        metrics=metrics,
+                        metrics=metrics_summary,
                         details={"rule_id": str(rule.id), "rule_name": rule.name}
                     )
 

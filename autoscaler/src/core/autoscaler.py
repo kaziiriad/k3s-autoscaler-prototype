@@ -84,8 +84,7 @@ class K3sAutoscaler:
                 decision_result['dry_run'] = True
                 decision_result['success'] = True
 
-            # Update database with current state
-            log_section(logger, "DATABASE UPDATE")
+            # Update Prometheus metrics if configured
             self._update_state(metrics_data, decision_result)
 
             return {
@@ -143,24 +142,69 @@ class K3sAutoscaler:
         #     logger.info(f"Recent scale down, waiting: {remaining}s remaining")
         #     return False
 
-        # Add workers
+        # Track created nodes for atomic rollback
+        created_nodes = []
         added = 0
-        for i in range(count):
-            worker_node = self._create_worker_node()
-            if worker_node:
-                self.database.add_worker(worker_node)
-                added += 1
 
-        if added > 0:
-            # Set cooldown
+        try:
+            # Initialize Docker client if not already done
+            if not hasattr(self, 'docker_client'):
+                if self.config['autoscaler']['dry_run']:
+                    logger.info("Dry-run mode: skipping Docker container creation")
+                    return False
+                self.docker_client = docker.from_env()
+                self.docker_client.ping()
+                logger.info("Docker client initialized")
+
+            # Create all nodes first
+            for i in range(count):
+                worker_node = self._create_worker_node_atomic()
+                if worker_node:
+                    created_nodes.append(worker_node)
+                    added += 1
+                else:
+                    break
+
+            if added == 0:
+                logger.warning("No nodes were added during scale up")
+                return False
+
+            # All containers created successfully, now verify with Kubernetes and update database atomically
+            verified_nodes = []
+            for worker_node in created_nodes:
+                # Wait for node to register in Kubernetes
+                if self._wait_for_kubernetes_node(worker_node.node_name):
+                    verified_nodes.append(worker_node)
+                else:
+                    logger.warning(f"Node {worker_node.node_name} failed to register in Kubernetes")
+
+            if not verified_nodes:
+                logger.error("No nodes registered in Kubernetes, rolling back")
+                self._rollback_created_nodes(created_nodes)
+                return False
+
+            # Update database with verified nodes
+            for worker_node in verified_nodes:
+                worker_node.status = NodeStatus.READY
+                self.database.add_worker(worker_node)
+
+            # Set cooldown after successful database update
             self.database.set_cooldown("scale_up", self.config['autoscaler']['limits']['scale_up_cooldown'])
             self.database.set_cluster_state("last_scale_up", datetime.utcnow().isoformat())
             self.last_scale_up = datetime.utcnow()
 
-            logger.info(f"Successfully scaled up by {added} nodes")
-            return True
-        else:
-            logger.warning("No nodes were added during scale up")
+            logger.info(f"Successfully scaled up by {len(verified_nodes)} nodes")
+            # Rollback any nodes that didn't verify
+            if len(verified_nodes) < len(created_nodes):
+                unverified = [n for n in created_nodes if n not in verified_nodes]
+                self._rollback_created_nodes(unverified)
+
+            return len(verified_nodes) > 0
+
+        except Exception as e:
+            # Rollback: remove any containers that were created
+            logger.error(f"Scale up failed, rolling back: {e}")
+            self._rollback_created_nodes(created_nodes)
             return False
 
     def _scale_down(self, count: int, decision: Dict[str, Any], metrics: Dict[str, Any] = None) -> bool:
@@ -196,22 +240,260 @@ class K3sAutoscaler:
         workers = self.database.get_all_workers()
         workers_to_remove = workers[-count:] if count < len(workers) else workers
 
-        removed = 0
-        for worker in workers_to_remove:
-            if self.database.remove_worker(worker.node_name):
-                removed += 1
+        # Track removed containers for rollback
+        removed_containers = []
+        removed_workers = []
 
-        if removed > 0:
-            # Set cooldown
-            self.database.set_cooldown("scale_down", self.config['autoscaler']['limits']['scale_down_cooldown'])
-            self.database.set_cluster_state("last_scale_down", datetime.utcnow().isoformat())
-            self.last_scale_down = datetime.utcnow()
+        try:
+            # Initialize Docker client if not already done
+            if not hasattr(self, 'docker_client'):
+                self.docker_client = docker.from_env()
+                self.docker_client.ping()
 
-            logger.info(f"Successfully scaled down by {removed} nodes")
-            return True
-        else:
-            logger.warning("No nodes were removed during scale down")
+            # Drain and remove from Kubernetes first (graceful removal)
+            for worker in workers_to_remove:
+                try:
+                    if self._drain_kubernetes_node(worker.node_name):
+                        logger.info(f"Drained Kubernetes node: {worker.node_name}")
+                    else:
+                        logger.warning(f"Failed to drain Kubernetes node: {worker.node_name}")
+                except Exception as e:
+                    logger.error(f"Error draining node {worker.node_name}: {e}")
+
+            # Remove Docker containers after draining
+            for worker in workers_to_remove:
+                try:
+                    container = self.docker_client.containers.get(worker.container_id)
+                    container.remove(force=True)
+                    removed_containers.append(worker)
+                    logger.info(f"Removed container: {worker.node_name}")
+                except docker.errors.NotFound:
+                    logger.warning(f"Container not found: {worker.node_name}")
+                    removed_containers.append(worker)
+                except Exception as e:
+                    logger.error(f"Failed to remove container {worker.node_name}: {e}")
+
+            # Wait for nodes to be removed from Kubernetes
+            verified_removed = []
+            for worker in removed_containers:
+                if self._wait_for_kubernetes_node_removal(worker.node_name):
+                    verified_removed.append(worker)
+                else:
+                    logger.warning(f"Node {worker.node_name} still in Kubernetes")
+
+            # Update database with verified removals
+            for worker in verified_removed:
+                if self.database.remove_worker(worker.node_name):
+                    removed_workers.append(worker)
+
+            if removed_workers:
+                # Set cooldown after successful database update
+                self.database.set_cooldown("scale_down", self.config['autoscaler']['limits']['scale_down_cooldown'])
+                self.database.set_cluster_state("last_scale_down", datetime.utcnow().isoformat())
+                self.last_scale_down = datetime.utcnow()
+
+                logger.info(f"Successfully scaled down by {len(removed_workers)} nodes")
+                return True
+            else:
+                logger.warning("No nodes were removed during scale down")
+                return False
+
+        except Exception as e:
+            # Rollback: we can't easily "undo" container removal, but we can log the error
+            logger.error(f"Scale down failed: {e}")
             return False
+
+    def _create_worker_node_atomic(self) -> Optional[WorkerNode]:
+        """Create a new worker node (Docker container only, no database updates)"""
+        try:
+            # Find the next available worker number
+            existing_workers = []
+            containers = self.docker_client.containers.list(all=True)
+            for container in containers:
+                if container.name and container.name.startswith(self.worker_prefix):
+                    try:
+                        num = int(container.name.split('-')[-1])
+                        existing_workers.append(num)
+                    except:
+                        pass
+
+            next_num = max(existing_workers) + 1 if existing_workers else 3
+            node_name = f"{self.worker_prefix}-{next_num}"
+
+            logger.info(f"Creating worker node: {node_name}")
+
+            # Create the container
+            container = self.docker_client.containers.run(
+                image=self.config['autoscaler']['docker']['image'],
+                name=node_name,
+                detach=True,
+                privileged=True,
+                environment={
+                    'K3S_URL': f"https://{self.config['autoscaler']['kubernetes'].get('server_host', 'k3s-master')}:6443",
+                    'K3S_TOKEN': os.getenv('K3S_TOKEN', 'mysupersecrettoken12345'),
+                    'K3S_NODE_NAME': node_name,
+                    'K3S_WITH_NODE_ID': 'true'
+                },
+                volumes={
+                    f'/tmp/k3s-{node_name}': {'bind': '/var/lib/rancher/k3s', 'mode': 'rw'},
+                },
+                network=self.config['autoscaler']['docker']['network'],
+                restart_policy={'Name': 'always'}
+            )
+
+            # Create worker node record (without database updates)
+            worker_node = WorkerNode(
+                node_name=node_name,
+                container_id=container.id,
+                container_name=node_name,
+                status=NodeStatus.INITIALIZING,
+                launched_at=datetime.utcnow(),
+                metadata={
+                    "created_by": "autoscaler",
+                    "container_image": self.config['autoscaler']['docker']['image'],
+                    "network": self.config['autoscaler']['docker']['network']
+                }
+            )
+
+            logger.info(f"Created container: {node_name}")
+            return worker_node
+
+        except Exception as e:
+            logger.error(f"Failed to create worker node: {e}")
+            return None
+
+    def _wait_for_kubernetes_node(self, node_name: str, timeout: int = 60) -> bool:
+        """Wait for a node to register in Kubernetes"""
+        logger.info(f"Waiting for node {node_name} to register in Kubernetes...")
+
+        if not hasattr(self.metrics, 'k8s_api') or not self.metrics.k8s_api:
+            logger.warning("Kubernetes API not available, skipping node verification")
+            return True  # Assume success if we can't verify
+
+        start_time = datetime.utcnow()
+        while (datetime.utcnow() - start_time).total_seconds() < timeout:
+            try:
+                # Check if node exists in Kubernetes
+                node = self.metrics.k8s_api.read_node(name=node_name)
+
+                # Check if node is ready
+                if node.status.conditions:
+                    for condition in node.status.conditions:
+                        if condition.type == "Ready" and condition.status == "True":
+                            logger.info(f"Node {node_name} is ready in Kubernetes")
+                            return True
+
+                logger.debug(f"Node {node_name} found but not ready yet")
+
+            except Exception as e:
+                logger.debug(f"Node {node_name} not yet registered: {e}")
+
+            time.sleep(5)
+
+        logger.warning(f"Timeout waiting for node {node_name} to register in Kubernetes")
+        return False
+
+    def _drain_kubernetes_node(self, node_name: str, timeout: int = 120) -> bool:
+        """Drain a Kubernetes node before removal"""
+        if not hasattr(self.metrics, 'k8s_api') or not self.metrics.k8s_api:
+            logger.warning("Kubernetes API not available, skipping node drain")
+            return True
+
+        try:
+            from kubernetes import client as k8s_client
+
+            # Drain the node
+            logger.info(f"Draining Kubernetes node: {node_name}")
+
+            # 1. Mark the node as unschedulable
+            node = self.metrics.k8s_api.read_node(name=node_name)
+
+            # Create a patch to mark as unschedulable
+            patch_body = {
+                "spec": {
+                    "unschedulable": True
+                }
+            }
+            self.metrics.k8s_api.patch_node(name=node_name, body=patch_body)
+
+            # 2. Evict all pods from the node (except system pods)
+            pods = self.metrics.k8s_api.list_pod_for_all_namespaces(
+                field_selector=f"spec.nodeName={node_name}"
+            )
+
+            evicted_count = 0
+            for pod in pods.items:
+                # Skip system pods
+                if pod.metadata.namespace in ["kube-system", "kube-public"]:
+                    continue
+
+                try:
+                    # Use eviction API to gracefully evict pods
+                    eviction = k8s_client.V1Eviction(
+                        metadata=k8s_client.V1ObjectMeta(
+                            name=pod.metadata.name,
+                            namespace=pod.metadata.namespace
+                        )
+                    )
+
+                    # Create eviction using the core API
+                    self.metrics.k8s_api.create_namespaced_pod_eviction(
+                        name=pod.metadata.name,
+                        namespace=pod.metadata.namespace,
+                        body=eviction
+                    )
+                    logger.info(f"Evicted pod {pod.metadata.name}/{pod.metadata.namespace}")
+                    evicted_count += 1
+                except Exception as e:
+                    # If eviction fails, log but continue
+                    logger.debug(f"Could not evict pod {pod.metadata.name}: {e}")
+
+            logger.info(f"Successfully drained Kubernetes node: {node_name} (evicted {evicted_count} pods)")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error draining node {node_name}: {e}")
+            return False
+
+    def _wait_for_kubernetes_node_removal(self, node_name: str, timeout: int = 60) -> bool:
+        """Wait for a node to be removed from Kubernetes"""
+        logger.info(f"Waiting for node {node_name} to be removed from Kubernetes...")
+
+        if not hasattr(self.metrics, 'k8s_api') or not self.metrics.k8s_api:
+            logger.warning("Kubernetes API not available, skipping node removal verification")
+            return True
+
+        start_time = datetime.utcnow()
+        while (datetime.utcnow() - start_time).total_seconds() < timeout:
+            try:
+                # Check if node still exists in Kubernetes
+                self.metrics.k8s_api.read_node(name=node_name)
+                # Node still exists, wait longer
+                logger.debug(f"Node {node_name} still exists in Kubernetes")
+            except Exception as e:
+                # Node not found - good!
+                logger.info(f"Node {node_name} removed from Kubernetes")
+                return True
+
+            time.sleep(5)
+
+        logger.warning(f"Timeout waiting for node {node_name} removal from Kubernetes")
+        return False
+
+    def _rollback_created_nodes(self, created_nodes: List[WorkerNode]):
+        """Rollback created nodes if scale up fails"""
+        logger.warning(f"Rolling back {len(created_nodes)} created nodes")
+
+        for worker_node in created_nodes:
+            try:
+                # Remove Docker container
+                container = self.docker_client.containers.get(worker_node.container_id)
+                container.remove(force=True)
+                logger.info(f"Rolled back container: {worker_node.node_name}")
+            except docker.errors.NotFound:
+                logger.warning(f"Container not found during rollback: {worker_node.node_name}")
+            except Exception as e:
+                logger.error(f"Failed to rollback container {worker_node.node_name}: {e}")
 
     def _create_worker_node(self) -> Optional[WorkerNode]:
         """Create a new worker node by launching a Docker container"""

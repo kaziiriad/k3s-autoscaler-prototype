@@ -118,9 +118,9 @@ def log_separator(logger: logging.Logger, title: str = "", length: int = 80):
     if title:
         # Center the title
         padding = (length - len(title) - 4) // 2
-        separator = f"\n{'=' * padding} {title} {'=' * (length - padding - len(title) - 4)}\n"
+        separator = f"\n\n{'=' * padding} {title} {'=' * (length - padding - len(title) - 4)}\n"
     else:
-        separator = f"\n{'=' * length}\n"
+        separator = f"\n\n{'=' * length}\n"
 
     logger.info(separator)
 
@@ -134,7 +134,7 @@ def log_section(logger: logging.Logger, section_name: str):
         section_name: Name of the section
     """
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    logger.info(f"\n--- {section_name} [{timestamp}] ---\n")
+    logger.info(f"\n\n--- {section_name} [{timestamp}] ---")
 
 
 # Configure logging on import
