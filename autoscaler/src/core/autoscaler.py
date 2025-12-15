@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from database import DatabaseManager, WorkerNode, NodeStatus, ScalingEventType
 from .metrics import MetricsCollector
 from .scaling import ScalingEngine
+from core.logging_config import log_separator, log_section
 
 logger = logging.getLogger(__name__)
 
@@ -52,14 +53,21 @@ class K3sAutoscaler:
         Returns:
             Dict containing cycle results
         """
+        # Add cycle separator
+        cycle_number = getattr(self, '_cycle_counter', 0) + 1
+        self._cycle_counter = cycle_number
+        log_separator(logger, f"AUTOSCALING CYCLE #{cycle_number}", 60)
+
         try:
             # Collect metrics
+            log_section(logger, "METRICS COLLECTION")
             metrics_data = self.metrics.collect()
             logger.info(f"Collected metrics: {metrics_data.current_nodes} nodes, "
                        f"{metrics_data.pending_pods} pending, "
                        f"CPU: {metrics_data.avg_cpu:.1f}%, Memory: {metrics_data.avg_memory:.1f}%")
 
             # Make scaling decision
+            log_section(logger, "SCALING DECISION")
             decision_result = self.scaling.evaluate_scaling(metrics_data)
 
             # Execute scaling decision
@@ -67,14 +75,17 @@ class K3sAutoscaler:
             logger.info(f"Dry-run mode: {dry_run_enabled}, Should scale: {decision_result.get('should_scale', False)}")
 
             if decision_result['should_scale'] and not dry_run_enabled:
+                log_section(logger, "SCALING EXECUTION")
                 success = self._execute_scaling(decision_result, metrics_data)
                 decision_result['success'] = success
             elif dry_run_enabled:
+                log_section(logger, "DRY RUN MODE")
                 logger.info("Dry-run mode: Skipping actual scaling execution")
                 decision_result['dry_run'] = True
                 decision_result['success'] = True
 
             # Update database with current state
+            log_section(logger, "DATABASE UPDATE")
             self._update_state(metrics_data, decision_result)
 
             return {

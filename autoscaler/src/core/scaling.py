@@ -4,7 +4,7 @@ Scaling engine module for making scaling decisions
 """
 
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 from datetime import datetime, timedelta
 from database import DatabaseManager, ScalingRule
 from database.mongodb import ScalingEventType
@@ -28,12 +28,12 @@ class ScalingEngine:
         self.thresholds = config['autoscaler']['thresholds']
         self.limits = config['autoscaler']['limits']
 
-    def evaluate_scaling(self, metrics: Dict[str, Any]) -> Dict[str, Any]:
+    def evaluate_scaling(self, metrics: Union[Dict[str, Any], 'ClusterMetrics']) -> Dict[str, Any]:
         """
         Evaluate metrics and determine if scaling is needed
 
         Args:
-            metrics: Current cluster metrics
+            metrics: Current cluster metrics (Dict or ClusterMetrics object)
 
         Returns:
             Dict containing scaling decision
@@ -53,10 +53,19 @@ class ScalingEngine:
                 decision["reason"] = "Both scale up and down in cooldown"
                 return decision
 
-            current_nodes = metrics.get("current_nodes", 0)
-            pending_pods = metrics.get("pending_pods", 0)
-            avg_cpu = metrics.get("avg_cpu", 0.0)
-            avg_memory = metrics.get("avg_memory", 0.0)
+            # Extract metrics from either Dict or ClusterMetrics object
+            if hasattr(metrics, 'current_nodes'):
+                # ClusterMetrics object
+                current_nodes = metrics.current_nodes
+                pending_pods = metrics.pending_pods
+                avg_cpu = metrics.avg_cpu
+                avg_memory = metrics.avg_memory
+            else:
+                # Dict object
+                current_nodes = metrics.get("current_nodes", 0)
+                pending_pods = metrics.get("pending_pods", 0)
+                avg_cpu = metrics.get("avg_cpu", 0.0)
+                avg_memory = metrics.get("avg_memory", 0.0)
 
             # Get scaling rules from database
             rules = self.database.get_scaling_rules(enabled_only=True)
@@ -99,7 +108,7 @@ class ScalingEngine:
             decision["reason"] = f"Error: {str(e)}"
             return decision
 
-    def _evaluate_rule(self, rule: ScalingRule, metrics: Dict, current_nodes: int) -> bool:
+    def _evaluate_rule(self, rule: ScalingRule, metrics: Union[Dict, 'ClusterMetrics'], current_nodes: int) -> bool:
         """Evaluate a single scaling rule"""
         try:
             # Get metric value
@@ -181,16 +190,31 @@ class ScalingEngine:
         decision["reason"] = "No scaling conditions met"
         return decision
 
-    def _get_metric_value(self, metric_name: str, metrics: Dict) -> Optional[float]:
+    def _get_metric_value(self, metric_name: str, metrics: Union[Dict, 'ClusterMetrics']) -> Optional[float]:
         """Get value for a specific metric"""
-        metric_map = {
-            "cpu": metrics.get("avg_cpu", 0),
-            "memory": metrics.get("avg_memory", 0),
-            "pending_pods": metrics.get("pending_pods", 0),
-            "node_count": metrics.get("current_nodes", 0)
-        }
+        # Extract values based on object type
+        if hasattr(metrics, 'current_nodes'):
+            # ClusterMetrics object
+            if metric_name == "cpu":
+                return metrics.avg_cpu
+            elif metric_name == "memory":
+                return metrics.avg_memory
+            elif metric_name == "pending_pods":
+                return metrics.pending_pods
+            elif metric_name == "node_count":
+                return metrics.current_nodes
+        else:
+            # Dict object
+            if metric_name == "cpu":
+                return metrics.get("avg_cpu", 0)
+            elif metric_name == "memory":
+                return metrics.get("avg_memory", 0)
+            elif metric_name == "pending_pods":
+                return metrics.get("pending_pods", 0)
+            elif metric_name == "node_count":
+                return metrics.get("current_nodes", 0)
 
-        return metric_map.get(metric_name)
+        return None
 
     def _compare_values(self, value: float, operator: str, threshold: float) -> bool:
         """Compare two values using the specified operator"""

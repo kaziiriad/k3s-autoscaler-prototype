@@ -106,6 +106,37 @@ def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(name)
 
 
+def log_separator(logger: logging.Logger, title: str = "", length: int = 80):
+    """
+    Log a visual separator with optional title
+
+    Args:
+        logger: Logger instance
+        title: Optional title to display in the separator
+        length: Length of the separator line
+    """
+    if title:
+        # Center the title
+        padding = (length - len(title) - 4) // 2
+        separator = f"\n{'=' * padding} {title} {'=' * (length - padding - len(title) - 4)}\n"
+    else:
+        separator = f"\n{'=' * length}\n"
+
+    logger.info(separator)
+
+
+def log_section(logger: logging.Logger, section_name: str):
+    """
+    Log a section header with timestamp
+
+    Args:
+        logger: Logger instance
+        section_name: Name of the section
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    logger.info(f"\n--- {section_name} [{timestamp}] ---\n")
+
+
 # Configure logging on import
 setup_logging(
     level="INFO",
