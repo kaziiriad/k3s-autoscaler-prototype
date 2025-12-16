@@ -15,6 +15,8 @@ from .repositories import (
 )
 from .mongodb import WorkerNode, ScalingEvent, ClusterState, ScalingRule, NodeStatus, ScalingEventType
 from .redis_client import AutoscalerRedisClient
+from cache.redis_cache import RedisCache
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -22,29 +24,30 @@ logger = logging.getLogger(__name__)
 class DatabaseManager:
     """Coordinates MongoDB and Redis operations for the autoscaler"""
 
-    def __init__(self, mongodb_url: str = "mongodb://localhost:27017",
-                 database_name: str = "autoscaler",
-                 redis_host: str = "localhost",
-                 redis_port: int = 6379,
-                 redis_db: int = 0,
+    def __init__(self, mongodb_url: Optional[str] = None,
+                 database_name: Optional[str] = None,
+                 redis_host: Optional[str] = None,
+                 redis_port: Optional[int] = None,
+                 redis_db: Optional[int] = None,
                  redis_password: Optional[str] = None):
         """
         Initialize database manager
 
         Args:
-            mongodb_url: MongoDB connection string
-            database_name: MongoDB database name
-            redis_host: Redis host
-            redis_port: Redis port
-            redis_db: Redis database number
-            redis_password: Redis password
+            mongodb_url: MongoDB connection string (overrides settings)
+            database_name: MongoDB database name (overrides settings)
+            redis_host: Redis host (overrides settings)
+            redis_port: Redis port (overrides settings)
+            redis_db: Redis database number (overrides settings)
+            redis_password: Redis password (overrides settings)
         """
-        self.mongodb_url = mongodb_url
-        self.database_name = database_name
-        self.redis_host = redis_host
-        self.redis_port = redis_port
-        self.redis_db = redis_db
-        self.redis_password = redis_password
+        # Use provided values or fall back to settings
+        self.mongodb_url = mongodb_url or settings.mongodb.url
+        self.database_name = database_name or settings.mongodb.database_name
+        self.redis_host = redis_host or settings.redis.host
+        self.redis_port = redis_port or settings.redis.port
+        self.redis_db = redis_db or settings.redis.db
+        self.redis_password = redis_password or settings.redis.password
 
         # Repository instances
         self.workers = None
@@ -52,8 +55,9 @@ class DatabaseManager:
         self.state = None
         self.rules = None
 
-        # Redis client
-        self.redis = None
+        # Redis clients
+        self.redis = None  # Legacy Redis client
+        self.cache = None  # New RedisCache for faster persistence
 
         self.connect()
 
@@ -73,6 +77,12 @@ class DatabaseManager:
                 db=self.redis_db,
                 password=self.redis_password
             )
+
+            # Initialize RedisCache for faster persistence
+            redis_url = f"redis://{self.redis_host}:{self.redis_port}/{self.redis_db}"
+            if self.redis_password:
+                redis_url = f"redis://:{self.redis_password}@{self.redis_host}:{self.redis_port}/{self.redis_db}"
+            self.cache = RedisCache(redis_url)
 
             logger.info("Database manager connected successfully")
             return True
@@ -96,10 +106,18 @@ class DatabaseManager:
         """Add a new worker node"""
         # Save to MongoDB
         if self.workers.save(node):
-            # Set in Redis for quick access
-            self.redis.set_worker_status(node.node_name, node.status.value)
-            if node.metadata:
-                self.redis.set_worker_metadata(node.node_name, node.metadata)
+            # Add to RedisCache for fast persistence
+            if self.cache:
+                self.cache.add_worker(node)
+                self.cache.store_scale_event("scale_up", 1, f"Added worker {node.node_name}",
+                    {"node_name": node.node_name, "container_id": node.container_id})
+
+            # Also set in legacy Redis for compatibility
+            if self.redis:
+                self.redis.set_worker_status(node.node_name, node.status.value)
+                if node.metadata:
+                    self.redis.set_worker_metadata(node.node_name, node.metadata)
+
             # Record event
             self.record_scaling_event(
                 ScalingEventType.SCALE_UP,
@@ -152,7 +170,20 @@ class DatabaseManager:
 
     def get_all_workers(self) -> List[WorkerNode]:
         """Get all worker nodes"""
-        return self.workers.get_active_nodes()
+        # First try to get from RedisCache for faster retrieval
+        if self.cache and self.cache.is_connected():
+            cached_workers = self.cache.get_cached_workers()
+            if cached_workers:
+                return cached_workers
+
+        # Cache miss, get from MongoDB and cache result
+        workers = self.workers.get_active_nodes()
+
+        # Cache the result for future use
+        if self.cache and workers:
+            self.cache.cache_workers(workers)
+
+        return workers
 
     def get_ready_workers(self) -> List[WorkerNode]:
         """Get all ready workers"""
@@ -250,24 +281,52 @@ class DatabaseManager:
     # Cooldown Management
     def set_cooldown(self, action: str, seconds: int):
         """Set cooldown timer"""
-        self.redis.set_cooldown(action, seconds)
+        # Use RedisCache for faster persistence
+        if self.cache:
+            self.cache.set_cooldown(action, seconds)
+        # Fallback to legacy Redis
+        elif self.redis:
+            self.redis.set_cooldown(action, seconds)
 
     def is_cooldown_active(self, action: str) -> bool:
         """Check if cooldown is active"""
-        return self.redis.is_cooldown_active(action)
+        # Use RedisCache for faster lookup
+        if self.cache:
+            return self.cache.is_cooldown_active(action)
+        # Fallback to legacy Redis
+        elif self.redis:
+            return self.redis.is_cooldown_active(action)
+        return False
 
     def get_cooldown_remaining(self, action: str) -> int:
         """Get remaining cooldown time"""
-        return self.redis.get_cooldown_remaining(action)
+        # Use RedisCache for faster lookup
+        if self.cache:
+            return self.cache.get_cooldown_remaining(action)
+        # Fallback to legacy Redis
+        elif self.redis:
+            return self.redis.get_cooldown_remaining(action)
+        return 0
 
     # Metrics Caching
     def cache_metrics(self, metrics: Dict, expire: int = 10):
         """Cache cluster metrics"""
-        self.redis.cache_metrics(metrics, expire)
+        # Use RedisCache for faster caching
+        if self.cache:
+            self.cache.cache_metrics(metrics, ttl=expire)
+        # Fallback to legacy Redis
+        elif self.redis:
+            self.redis.cache_metrics(metrics, expire)
 
     def get_cached_metrics(self) -> Optional[Dict]:
         """Get cached metrics"""
-        return self.redis.get_cached_metrics()
+        # Use RedisCache for faster retrieval
+        if self.cache:
+            return self.cache.get_cached_metrics()
+        # Fallback to legacy Redis
+        elif self.redis:
+            return self.redis.get_cached_metrics()
+        return None
 
     # Health Check Operations
     def record_health_check(self, node_name: str, check_type: str, status: str,

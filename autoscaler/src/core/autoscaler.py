@@ -7,11 +7,13 @@ import logging
 import time
 import docker
 import os
+import asyncio
 from typing import Dict, List, Optional, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from database import DatabaseManager, WorkerNode, NodeStatus, ScalingEventType
 from .metrics import MetricsCollector
 from .scaling import ScalingEngine
+from .async_scaling import AsyncScalingManager
 from core.logging_config import log_separator, log_section
 
 logger = logging.getLogger(__name__)
@@ -36,12 +38,18 @@ class K3sAutoscaler:
         self.metrics = MetricsCollector(config, database)
         self.scaling = ScalingEngine(config, database)
 
+        # Initialize async scaling manager
+        self.async_scaling = AsyncScalingManager(
+            config=config,
+            max_workers=config.get('autoscaler', {}).get('max_concurrent_operations', 3)
+        )
+
         # Initialize default state
         self.worker_prefix = "k3s-worker"
         self.last_scale_up = None
         self.last_scale_down = None
 
-        logger.info("K3s Autoscaler initialized with database support")
+        logger.info("K3s Autoscaler initialized with database support and async operations")
 
         # Sync database with actual cluster state on startup
         self._sync_database_with_cluster()
@@ -90,7 +98,7 @@ class K3sAutoscaler:
             return {
                 "metrics": metrics_data,
                 "decision": decision_result,
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }
 
         except Exception as e:
@@ -106,7 +114,7 @@ class K3sAutoscaler:
             )
             return {
                 "error": str(e),
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }
 
     def _execute_scaling(self, decision: Dict[str, Any], metrics: Dict[str, Any] = None) -> bool:
@@ -127,8 +135,8 @@ class K3sAutoscaler:
             return False
 
     def _scale_up(self, count: int, decision: Dict[str, Any]) -> bool:
-        """Scale up by adding worker nodes"""
-        logger.info(f"Scaling up by {count} nodes")
+        """Scale up by adding worker nodes using async operations"""
+        logger.info(f"Scaling up by {count} nodes (async mode)")
 
         # Check both cooldowns to prevent rapid oscillation
         if self.database.is_cooldown_active("scale_up"):
@@ -142,10 +150,6 @@ class K3sAutoscaler:
         #     logger.info(f"Recent scale down, waiting: {remaining}s remaining")
         #     return False
 
-        # Track created nodes for atomic rollback
-        created_nodes = []
-        added = 0
-
         try:
             # Initialize Docker client if not already done
             if not hasattr(self, 'docker_client'):
@@ -156,60 +160,52 @@ class K3sAutoscaler:
                 self.docker_client.ping()
                 logger.info("Docker client initialized")
 
-            # Create all nodes first
-            for i in range(count):
-                worker_node = self._create_worker_node_atomic()
-                if worker_node:
-                    created_nodes.append(worker_node)
-                    added += 1
-                else:
-                    break
+            # Initialize Kubernetes API for async scaling manager
+            if hasattr(self.metrics, 'k8s_api') and self.metrics.k8s_api:
+                self.async_scaling.set_kubernetes_api(self.metrics.k8s_api)
+                logger.info("Kubernetes API set for async operations")
 
-            if added == 0:
-                logger.warning("No nodes were added during scale up")
+            # Run async scaling operation using existing event loop
+            try:
+                # Try to get current event loop
+                loop = asyncio.get_running_loop()
+                # If we're in an async context (FastAPI), we need to run in a thread
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(
+                        lambda: asyncio.run(self.async_scaling.scale_up_concurrent(count, self.docker_client, self.database))
+                    )
+                    successful_workers, error_messages = future.result()
+            except RuntimeError:
+                # No running loop, we can create a new one
+                successful_workers, error_messages = asyncio.run(
+                    self.async_scaling.scale_up_concurrent(count, self.docker_client, self.database)
+                )
+
+            # Log results
+            if error_messages:
+                for error in error_messages:
+                    logger.error(f"Scale-up error: {error}")
+
+            if not successful_workers:
+                logger.warning("No workers were added during scale-up")
                 return False
 
-            # All containers created successfully, now verify with Kubernetes and update database atomically
-            verified_nodes = []
-            for worker_node in created_nodes:
-                # Wait for node to register in Kubernetes
-                if self._wait_for_kubernetes_node(worker_node.node_name):
-                    verified_nodes.append(worker_node)
-                else:
-                    logger.warning(f"Node {worker_node.node_name} failed to register in Kubernetes")
-
-            if not verified_nodes:
-                logger.error("No nodes registered in Kubernetes, rolling back")
-                self._rollback_created_nodes(created_nodes)
-                return False
-
-            # Update database with verified nodes
-            for worker_node in verified_nodes:
-                worker_node.status = NodeStatus.READY
-                self.database.add_worker(worker_node)
-
-            # Set cooldown after successful database update
+            # Set cooldown after successful scale-up
             self.database.set_cooldown("scale_up", self.config['autoscaler']['limits']['scale_up_cooldown'])
-            self.database.set_cluster_state("last_scale_up", datetime.utcnow().isoformat())
-            self.last_scale_up = datetime.utcnow()
+            self.database.set_cluster_state("last_scale_up", datetime.now(timezone.utc).isoformat())
+            self.last_scale_up = datetime.now(timezone.utc)
 
-            logger.info(f"Successfully scaled up by {len(verified_nodes)} nodes")
-            # Rollback any nodes that didn't verify
-            if len(verified_nodes) < len(created_nodes):
-                unverified = [n for n in created_nodes if n not in verified_nodes]
-                self._rollback_created_nodes(unverified)
-
-            return len(verified_nodes) > 0
+            logger.info(f"Successfully scaled up by {len(successful_workers)} nodes in async mode")
+            return True
 
         except Exception as e:
-            # Rollback: remove any containers that were created
-            logger.error(f"Scale up failed, rolling back: {e}")
-            self._rollback_created_nodes(created_nodes)
+            logger.error(f"Async scale-up failed: {e}")
             return False
 
     def _scale_down(self, count: int, decision: Dict[str, Any], metrics: Dict[str, Any] = None) -> bool:
-        """Scale down by removing worker nodes"""
-        logger.info(f"Scaling down by {count} nodes")
+        """Scale down by removing worker nodes using async operations"""
+        logger.info(f"Scaling down by {count} nodes (async mode)")
 
         # Check both cooldowns to prevent rapid oscillation
         if self.database.is_cooldown_active("scale_down"):
@@ -283,11 +279,31 @@ class K3sAutoscaler:
 
         # Get workers (most recently launched first)
         workers = self.database.get_all_workers()
-        workers_to_remove = workers[-count:] if count < len(workers) else workers
 
-        # Track removed containers for rollback
-        removed_containers = []
-        removed_workers = []
+        # If database is empty but we have Docker containers, create temporary worker objects
+        if not workers and actual_docker_nodes > 0:
+            logger.warning(f"Database has no workers but {actual_docker_nodes} Docker containers exist. Creating temporary worker objects.")
+            containers = [c for c in self.docker_client.containers.list(all=True)
+                          if c.name and c.name.startswith(self.worker_prefix)]
+
+            # Sort by creation time (newest first)
+            containers.sort(key=lambda c: c.attrs['Created'], reverse=True)
+
+            # Create temporary WorkerNode objects for removal
+            from database import WorkerNode, NodeStatus
+            workers = []
+            for container in containers[:count]:
+                worker = WorkerNode(
+                    node_name=container.name,
+                    container_id=container.id,
+                    container_name=container.name,
+                    status=NodeStatus.READY,  # Assume ready for removal
+                    launched_at=datetime.now(timezone.utc),
+                    metadata={"synced_from_docker": True}
+                )
+                workers.append(worker)
+
+        workers_to_remove = workers[-count:] if count < len(workers) else workers
 
         try:
             # Initialize Docker client if not already done
@@ -295,57 +311,47 @@ class K3sAutoscaler:
                 self.docker_client = docker.from_env()
                 self.docker_client.ping()
 
-            # Drain and remove from Kubernetes first (graceful removal)
-            for worker in workers_to_remove:
-                try:
-                    if self._drain_kubernetes_node(worker.node_name):
-                        logger.info(f"Drained Kubernetes node: {worker.node_name}")
-                    else:
-                        logger.warning(f"Failed to drain Kubernetes node: {worker.node_name}")
-                except Exception as e:
-                    logger.error(f"Error draining node {worker.node_name}: {e}")
+            # Initialize Kubernetes API for async scaling manager
+            if hasattr(self.metrics, 'k8s_api') and self.metrics.k8s_api:
+                self.async_scaling.set_kubernetes_api(self.metrics.k8s_api)
+                logger.info("Kubernetes API set for async operations")
 
-            # Remove Docker containers after draining
-            for worker in workers_to_remove:
-                try:
-                    container = self.docker_client.containers.get(worker.container_id)
-                    container.remove(force=True)
-                    removed_containers.append(worker)
-                    logger.info(f"Removed container: {worker.node_name}")
-                except docker.errors.NotFound:
-                    logger.warning(f"Container not found: {worker.node_name}")
-                    removed_containers.append(worker)
-                except Exception as e:
-                    logger.error(f"Failed to remove container {worker.node_name}: {e}")
+            # Run async scale-down operation using existing event loop
+            try:
+                # Try to get current event loop
+                loop = asyncio.get_running_loop()
+                # If we're in an async context (FastAPI), we need to run in a thread
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(
+                        lambda: asyncio.run(self.async_scaling.scale_down_concurrent(workers_to_remove, self.docker_client, self.database))
+                    )
+                    successful_removals, error_messages = future.result()
+            except RuntimeError:
+                # No running loop, we can create a new one
+                successful_removals, error_messages = asyncio.run(
+                    self.async_scaling.scale_down_concurrent(workers_to_remove, self.docker_client, self.database)
+                )
 
-            # Wait for nodes to be removed from Kubernetes
-            verified_removed = []
-            for worker in removed_containers:
-                if self._wait_for_kubernetes_node_removal(worker.node_name):
-                    verified_removed.append(worker)
-                else:
-                    logger.warning(f"Node {worker.node_name} still in Kubernetes")
+            # Log results
+            if error_messages:
+                for error in error_messages:
+                    logger.error(f"Scale-down error: {error}")
 
-            # Update database with verified removals
-            for worker in verified_removed:
-                if self.database.remove_worker(worker.node_name):
-                    removed_workers.append(worker)
-
-            if removed_workers:
-                # Set cooldown after successful database update
+            if successful_removals:
+                # Set cooldown after successful scale-down
                 self.database.set_cooldown("scale_down", self.config['autoscaler']['limits']['scale_down_cooldown'])
-                self.database.set_cluster_state("last_scale_down", datetime.utcnow().isoformat())
-                self.last_scale_down = datetime.utcnow()
+                self.database.set_cluster_state("last_scale_down", datetime.now(timezone.utc).isoformat())
+                self.last_scale_down = datetime.now(timezone.utc)
 
-                logger.info(f"Successfully scaled down by {len(removed_workers)} nodes")
+                logger.info(f"Successfully scaled down by {len(successful_removals)} nodes in async mode")
                 return True
             else:
                 logger.warning("No nodes were removed during scale down")
                 return False
 
         except Exception as e:
-            # Rollback: we can't easily "undo" container removal, but we can log the error
-            logger.error(f"Scale down failed: {e}")
+            logger.error(f"Async scale-down failed: {e}")
             return False
 
     def _create_worker_node_atomic(self) -> Optional[WorkerNode]:
@@ -392,7 +398,7 @@ class K3sAutoscaler:
                 container_id=container.id,
                 container_name=node_name,
                 status=NodeStatus.INITIALIZING,
-                launched_at=datetime.utcnow(),
+                launched_at=datetime.now(timezone.utc),
                 metadata={
                     "created_by": "autoscaler",
                     "container_image": self.config['autoscaler']['docker']['image'],
@@ -415,8 +421,8 @@ class K3sAutoscaler:
             logger.warning("Kubernetes API not available, skipping node verification")
             return True  # Assume success if we can't verify
 
-        start_time = datetime.utcnow()
-        while (datetime.utcnow() - start_time).total_seconds() < timeout:
+        start_time = datetime.now(timezone.utc)
+        while (datetime.now(timezone.utc) - start_time).total_seconds() < timeout:
             try:
                 # Check if node exists in Kubernetes
                 node = self.metrics.k8s_api.read_node(name=node_name)
@@ -532,8 +538,8 @@ class K3sAutoscaler:
             logger.warning("Kubernetes API not available, skipping node removal verification")
             return True
 
-        start_time = datetime.utcnow()
-        while (datetime.utcnow() - start_time).total_seconds() < timeout:
+        start_time = datetime.now(timezone.utc)
+        while (datetime.now(timezone.utc) - start_time).total_seconds() < timeout:
             try:
                 # Check if node still exists in Kubernetes
                 self.metrics.k8s_api.read_node(name=node_name)
@@ -617,7 +623,7 @@ class K3sAutoscaler:
                 container_id=container.id,
                 container_name=node_name,
                 status=NodeStatus.INITIALIZING,
-                launched_at=datetime.utcnow(),
+                launched_at=datetime.now(timezone.utc),
                 metadata={
                     "created_by": "autoscaler",
                     "container_image": self.config['autoscaler']['docker']['image'],
@@ -773,7 +779,7 @@ class K3sAutoscaler:
                 "last_seen": worker.last_seen.isoformat() if worker.last_seen else None,
                 "metadata": worker.metadata or {},
                 "health": health,
-                "age_seconds": int((datetime.utcnow() - worker.launched_at).total_seconds())
+                "age_seconds": int((datetime.now(timezone.utc) - worker.launched_at).total_seconds())
             })
 
         return details
@@ -810,12 +816,12 @@ class K3sAutoscaler:
                         container_id=container.id,
                         container_name=container_name,
                         status=NodeStatus.READY if container.status == 'running' else NodeStatus.STOPPED,
-                        launched_at=datetime.utcnow(),
+                        launched_at=datetime.now(timezone.utc),
                         metadata={
                             "created_by": "docker_compose",
                             "container_image": container.image.tags[0] if container.image.tags else "unknown",
                             "network": self.config['autoscaler']['docker']['network'],
-                            "synced_at": datetime.utcnow().isoformat()
+                            "synced_at": datetime.now(timezone.utc).isoformat()
                         }
                     )
                     self.database.add_worker(worker_node)
