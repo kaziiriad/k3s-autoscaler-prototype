@@ -5,6 +5,7 @@ Async scaling operations manager for concurrent worker node management
 
 import asyncio
 import concurrent.futures
+import json
 import logging
 import time
 import os
@@ -39,9 +40,15 @@ class AsyncScalingManager:
             thread_name_prefix="async-scaling"
         )
 
-        # Track operations
-        self.active_operations = {}
-        self.operation_history = []
+        # Track operations in Redis instead of memory
+        from config.settings import settings
+        from database.redis_client import AutoscalerRedisClient
+        self.redis = AutoscalerRedisClient(
+            host=settings.redis.host,
+            port=settings.redis.port,
+            db=settings.redis.cache_db,
+            password=settings.redis.password
+        )
 
         logger.info(f"AsyncScalingManager initialized with max_workers={max_workers}")
 
@@ -354,19 +361,30 @@ class AsyncScalingManager:
     def _create_worker_node_sync(self, worker_id: int, docker_client) -> Optional[WorkerNode]:
         """Synchronous worker creation (runs in thread pool)"""
         try:
-            # Find next available worker number
-            existing_workers = []
-            containers = docker_client.containers.list(all=True)
-            for container in containers:
-                if container.name and container.name.startswith("k3s-worker"):
-                    try:
-                        num = int(container.name.split('-')[-1])
-                        existing_workers.append(num)
-                    except:
-                        pass
+            from config.settings import settings
+            from database.redis_client import AutoscalerRedisClient
 
-            next_num = max(existing_workers) + 1 if existing_workers else 3
-            node_name = f"k3s-worker-{next_num}"
+            # Use Redis INCRBY for efficient worker numbering
+            redis_client = AutoscalerRedisClient(
+                host=settings.redis.host,
+                port=settings.redis.port,
+                db=settings.redis.cache_db,
+                password=settings.redis.password
+            )
+
+            # Get next worker number using Redis atomic increment
+            # This ensures no race conditions when multiple workers are created concurrently
+            worker_counter_key = "workers:next_number"
+
+            # Initialize counter if it doesn't exist
+            if not redis_client.exists(worker_counter_key):
+                redis_client.set(worker_counter_key, settings.autoscaler.worker_start_number - 1)
+
+            # Atomically increment to get next number
+            next_num = redis_client.increment(worker_counter_key, 1)
+            node_name = f"{settings.autoscaler.worker_prefix}-{next_num}"
+
+            logger.info(f"Allocated worker number {next_num} from Redis counter")
 
             # Create the container
             container = docker_client.containers.run(
@@ -384,7 +402,8 @@ class AsyncScalingManager:
                     f'/tmp/k3s-{node_name}': {'bind': '/var/lib/rancher/k3s', 'mode': 'rw'},
                 },
                 network=settings.docker.network,
-                restart_policy={'Name': 'always'}
+                restart_policy={'Name': 'always'},
+                labels={'com.docker.compose.project': 'prototype'}
             )
 
             worker_node = WorkerNode(
@@ -434,6 +453,35 @@ class AsyncScalingManager:
     def set_kubernetes_api(self, k8s_api):
         """Set Kubernetes API client for async operations"""
         self.k8s_api = k8s_api
+
+    def _add_active_operation(self, operation_id: str, operation_data: dict):
+        """Add an active operation to Redis"""
+        self.redis.hset("async_scaling:active_operations", operation_id, json.dumps(operation_data))
+        self.redis.expire("async_scaling:active_operations", 3600)  # Expire after 1 hour
+
+    def _remove_active_operation(self, operation_id: str):
+        """Remove an active operation from Redis"""
+        self.redis.hdel("async_scaling:active_operations", operation_id)
+
+    def _get_active_operations(self) -> dict:
+        """Get all active operations from Redis"""
+        operations = {}
+        for op_id, op_data in self.redis.hgetall("async_scaling:active_operations").items():
+            operations[op_id.decode()] = json.loads(op_data.decode())
+        return operations
+
+    def _add_operation_history(self, operation_data: dict):
+        """Add operation to history in Redis"""
+        history_key = "async_scaling:operation_history"
+        self.redis.lpush(history_key, json.dumps(operation_data))
+        self.redis.ltrim(history_key, 0, 999)  # Keep only 1000 most recent operations
+
+    def _get_operation_history(self, limit: int = 100) -> list:
+        """Get operation history from Redis"""
+        history = []
+        for record in self.redis.lrange("async_scaling:operation_history", 0, limit - 1):
+            history.append(json.loads(record.decode()))
+        return history
 
     async def cleanup(self):
         """Cleanup resources"""

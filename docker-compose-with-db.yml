@@ -176,16 +176,14 @@ services:
 
   # Autoscaler Service
   autoscaler:
-    build:
-      context: ./autoscaler
-      dockerfile: Dockerfile
-    container_name: autoscaler
+    image: autoscaler:redis-persistence
     ports:
       - "8080:8080"
       - "9091:9091"
     volumes:
       - ./kubeconfig:/app/kubeconfig:ro
       - /var/run/docker.sock:/var/run/docker.sock
+      - ./autoscaler/config:/app/config:ro
     environment:
       - KUBECONFIG=/app/kubeconfig/kubeconfig
       - WORKER_PREFIX=k3s-worker

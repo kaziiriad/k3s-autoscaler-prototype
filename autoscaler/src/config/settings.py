@@ -35,9 +35,13 @@ class RedisSettings(BaseSettings):
     """Redis configuration settings"""
     host: str = os.getenv("REDIS_HOST", "localhost")
     port: int = int(os.getenv("REDIS_PORT", "6379"))
-    db: int = int(os.getenv("REDIS_DB", "0"))
     password: Optional[str] = os.getenv("REDIS_PASSWORD", None)
     connection_timeout: int = int(os.getenv("REDIS_CONNECTION_TIMEOUT", "5"))
+
+    # Separate databases for different purposes
+    cache_db: int = int(os.getenv("REDIS_CACHE_DB", "0"))
+    events_db: int = int(os.getenv("REDIS_EVENTS_DB", "1"))
+    cooldown_db: int = int(os.getenv("REDIS_COOLDOWN_DB", "2"))
 
     class Config:
         extra = "ignore"
@@ -89,6 +93,11 @@ class AutoscalerSettings(BaseSettings):
     max_nodes: int = int(os.getenv("AUTOSCALER_MAX_NODES", "6"))
     scale_up_cooldown: int = int(os.getenv("AUTOSCALER_SCALE_UP_COOLDOWN", "60"))
     scale_down_cooldown: int = int(os.getenv("AUTOSCALER_SCALE_DOWN_COOLDOWN", "120"))
+
+    # Worker settings
+    worker_prefix: str = os.getenv("AUTOSCALER_WORKER_PREFIX", "k3s-worker")
+    permanent_workers: list = os.getenv("AUTOSCALER_PERMANENT_WORKERS", "k3s-worker-1,k3s-worker-2").split(",")
+    worker_start_number: int = int(os.getenv("AUTOSCALER_WORKER_START_NUMBER", "3"))
 
     # Token
     k3s_token: str = os.getenv("K3S_TOKEN", "mysupersecrettoken12345")
@@ -191,7 +200,10 @@ class Settings(BaseSettings):
                     "redis": {
                         "host": self.redis.host,
                         "port": self.redis.port,
-                        "db": self.redis.db,
+                        "db": self.redis.cache_db,
+                        "cache_db": self.redis.cache_db,
+                        "events_db": self.redis.events_db,
+                        "cooldown_db": self.redis.cooldown_db,
                         "password": self.redis.password,
                         "connection_timeout": self.redis.connection_timeout
                     }

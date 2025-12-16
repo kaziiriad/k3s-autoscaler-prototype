@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 import redis
 from database import WorkerNode, NodeStatus
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -16,23 +17,24 @@ logger = logging.getLogger(__name__)
 class RedisCache:
     """Redis cache for autoscaler data persistence"""
 
-    def __init__(self, redis_url: str = "redis://redis:6379/0"):
+    def __init__(self):
         """
-        Initialize Redis connection
-
-        Args:
-            redis_url: Redis connection URL
+        Initialize Redis connection using settings
         """
-        self.redis_url = redis_url
         self.client = None
         self._connect()
 
     def _connect(self):
         """Establish Redis connection"""
         try:
-            self.client = redis.from_url(self.redis_url, decode_responses=True)
+            # Build Redis URL using settings for cache database
+            redis_url = f"redis://{settings.redis.host}:{settings.redis.port}/{settings.redis.cache_db}"
+            if settings.redis.password:
+                redis_url = f"redis://:{settings.redis.password}@{settings.redis.host}:{settings.redis.port}/{settings.redis.cache_db}"
+
+            self.client = redis.from_url(redis_url, decode_responses=True)
             self.client.ping()
-            logger.info("Connected to Redis cache")
+            logger.info(f"Connected to Redis cache at {redis_url} (using DB {settings.redis.cache_db})")
         except Exception as e:
             logger.error(f"Failed to connect to Redis: {e}")
             self.client = None
@@ -173,15 +175,30 @@ class RedisCache:
             logger.error(f"Failed to remove worker from cache: {e}")
             return False
 
-    # Cooldown tracking
+    # Cooldown tracking - uses a dedicated cooldown Redis client
+    def _get_cooldown_client(self):
+        """Get a Redis client for cooldown operations"""
+        try:
+            # Build Redis URL for cooldown database
+            redis_url = f"redis://{settings.redis.host}:{settings.redis.port}/{settings.redis.cooldown_db}"
+            if settings.redis.password:
+                redis_url = f"redis://:{settings.redis.password}@{settings.redis.host}:{settings.redis.port}/{settings.redis.cooldown_db}"
+
+            return redis.from_url(redis_url, decode_responses=True)
+        except Exception as e:
+            logger.error(f"Failed to create cooldown client: {e}")
+            return None
+
     def set_cooldown(self, action: str, duration_seconds: int):
         """Set cooldown for scaling action"""
-        if not self.is_connected():
-            return False
-
         try:
+            client = self._get_cooldown_client()
+            if not client:
+                return False
+
             cooldown_key = f"autoscaler:cooldown:{action}"
-            self.client.setex(cooldown_key, duration_seconds, "active")
+            client.setex(cooldown_key, duration_seconds, "active")
+            client.close()
             logger.info(f"Set {action} cooldown for {duration_seconds}s")
             return True
 
@@ -191,12 +208,15 @@ class RedisCache:
 
     def is_cooldown_active(self, action: str) -> bool:
         """Check if cooldown is active for an action"""
-        if not self.is_connected():
-            return False
-
         try:
+            client = self._get_cooldown_client()
+            if not client:
+                return False
+
             cooldown_key = f"autoscaler:cooldown:{action}"
-            return self.client.exists(cooldown_key) > 0
+            active = client.exists(cooldown_key) > 0
+            client.close()
+            return active
 
         except Exception as e:
             logger.error(f"Failed to check cooldown: {e}")
@@ -204,12 +224,14 @@ class RedisCache:
 
     def get_cooldown_remaining(self, action: str) -> int:
         """Get remaining cooldown time in seconds"""
-        if not self.is_connected():
-            return 0
-
         try:
+            client = self._get_cooldown_client()
+            if not client:
+                return 0
+
             cooldown_key = f"autoscaler:cooldown:{action}"
-            ttl = self.client.ttl(cooldown_key)
+            ttl = client.ttl(cooldown_key)
+            client.close()
             return max(0, ttl)
 
         except Exception as e:

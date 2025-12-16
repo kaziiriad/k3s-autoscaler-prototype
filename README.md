@@ -20,6 +20,11 @@ A production-grade autoscaler that dynamically adds/removes Docker containers ru
 - ✅ **Type Safety**: Pydantic models for metrics and configuration
 - ✅ **Rollback Mechanisms**: Automatic rollback on failed operations
 - ✅ **Health Monitoring**: Built-in health checks and metrics endpoints
+- ✅ **Event-Driven Architecture**: Event bus for reactive scaling with retry logic
+- ✅ **Redis Persistence**: All state stored in Redis for consistency across restarts
+- ✅ **LIFO Scaling**: Last-In-First-Out scaling with permanent worker protection
+- ✅ **Concurrent Operations**: Async scaling manager for parallel container operations
+- ✅ **Namespace Support**: Workers launch in proper Docker namespace (prototype)
 
 ## Quick Start
 
@@ -93,6 +98,32 @@ Edit `autoscaler/config/config-with-db.yaml` to adjust:
 - **max_nodes**: Maximum worker nodes (default: 6)
 - **scale_up_cooldown**: Wait time after scale-up (default: 60s)
 - **scale_down_cooldown**: Wait time after scale-down (default: 120s)
+
+## Architecture Improvements (December 2025)
+
+### Event-Driven Architecture
+The autoscaler now uses an event bus pattern for reactive operations:
+- **Event Bus**: Central message hub for all scaling events
+- **Event Handlers**: Specialized handlers for different event types
+  - `ClusterStateSynced`: Syncs cluster state with database
+  - `NodeHealthDegraded`: Handles unhealthy node detection
+  - `OptimalStateTrigger`: Prevents unnecessary scaling oscillations
+  - `PendingPodsDetected`: Fast response to pod scheduling needs
+- **Retry Logic**: Automatic retry with exponential backoff for failed events
+
+### Enhanced State Management
+- **Redis-First Strategy**: All state stored in Redis for consistency
+  - Worker nodes tracking
+  - Cooldown periods
+  - Event history
+  - Minimum node enforcement statistics
+- **Namespace Support**: Workers created with proper Docker labels (`com.docker.compose.project=prototype`)
+
+### LIFO Scaling Implementation
+- **Permanent Workers**: Configurable workers that are never removed (k3s-worker-1, k3s-worker-2)
+- **Removable Workers**: Dynamic workers that scale based on load
+- **Last-In-First-Out**: Most recently created workers are removed first
+- **Atomic Operations**: Worker numbering using Redis INCR for race-free allocation
 
 ## How It Works
 
@@ -280,6 +311,27 @@ Dry-run mode: Skipping actual scaling execution
 
    # Check node resource usage
    docker exec k3s-master kubectl top nodes
+   ```
+
+5. **Redis cache showing wrong worker count**
+   ```bash
+   # Clear Redis cache to force resync
+   docker exec redis redis-cli FLUSHALL
+
+   # Restart autoscaler to rebuild cache
+   docker restart prototype-autoscaler-1
+
+   # Verify worker detection
+   docker logs prototype-autoscaler-1 | grep "Found worker node"
+   ```
+
+6. **Permanent workers not being protected**
+   ```bash
+   # Check permanent workers configuration
+   docker exec redis redis-cli GET "autoscaler:workers:permanent"
+
+   # Verify worker breakdown
+   docker logs prototype-autoscaler-1 | grep "Worker breakdown"
    ```
 
 ### Debug Mode

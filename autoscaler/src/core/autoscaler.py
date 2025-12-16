@@ -8,13 +8,25 @@ import time
 import docker
 import os
 import asyncio
+import json
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timezone
 from database import DatabaseManager, WorkerNode, NodeStatus, ScalingEventType
+from config.settings import settings
 from .metrics import MetricsCollector
 from .scaling import ScalingEngine
 from .async_scaling import AsyncScalingManager
 from core.logging_config import log_separator, log_section
+from events import (
+    EventBus,
+    Event,
+    ScalingActionCompleted,
+    ClusterStateSynced,
+    OptimalStateTrigger,
+    UnderutilizationWarning,
+    ResourcePressureAlert,
+    PendingPodsDetected
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,14 +57,22 @@ class K3sAutoscaler:
         )
 
         # Initialize default state
-        self.worker_prefix = "k3s-worker"
-        self.last_scale_up = None
-        self.last_scale_down = None
+        self.worker_prefix = settings.autoscaler.worker_prefix
 
-        logger.info("K3s Autoscaler initialized with database support and async operations")
+        # Initialize event bus for event-driven architecture
+        self.event_bus = EventBus()
+        self._event_bus_initialized = False
+
+        # Track optimal state emissions (backup for Redis)
+        self._last_optimal_state_emission = None
+
+        logger.info("K3s Autoscaler initialized with database support, async operations, and event-driven architecture")
 
         # Sync database with actual cluster state on startup
         self._sync_database_with_cluster()
+
+        # Initialize permanent workers in Redis
+        self._initialize_permanent_workers()
 
     def run_cycle(self) -> Dict[str, Any]:
         """
@@ -94,6 +114,35 @@ class K3sAutoscaler:
 
             # Update Prometheus metrics if configured
             self._update_state(metrics_data, decision_result)
+
+            # Check for optimal state and emit event if applicable
+            if (not decision_result.get('should_scale', False) and
+                metrics_data.current_nodes == self.config['autoscaler']['limits']['min_nodes'] and
+                metrics_data.avg_cpu < 50 and metrics_data.avg_memory < 80 and
+                metrics_data.pending_pods == 0):
+
+                # Check cooldown for OptimalStateTrigger (emit every 5 minutes max)
+                current_time = datetime.now(timezone.utc)
+                emit_cooldown = 300  # 5 minutes
+
+                if (self._last_optimal_state_emission is None or
+                    (current_time - self._last_optimal_state_emission).total_seconds() >= emit_cooldown):
+
+                    # Emit optimal state trigger
+                    self._emit_event_sync(OptimalStateTrigger(
+                        source="K3sAutoscaler",
+                        data={
+                            "current_workers": metrics_data.current_nodes,
+                            "min_workers": self.config['autoscaler']['limits']['min_nodes'],
+                            "cpu_avg": metrics_data.avg_cpu,
+                            "memory_avg": metrics_data.avg_memory,
+                            "pending_pods": metrics_data.pending_pods
+                        }
+                    ))
+
+                    # Update last emission time
+                    self._last_optimal_state_emission = current_time
+                    logger.debug(f"OptimalStateTrigger emitted (next allowed in {emit_cooldown}s)")
 
             return {
                 "metrics": metrics_data,
@@ -183,6 +232,8 @@ class K3sAutoscaler:
                 )
 
             # Log results
+            if successful_workers:
+                logger.info(f"Successfully scaled up by {len(successful_workers)} nodes: {successful_workers}")
             if error_messages:
                 for error in error_messages:
                     logger.error(f"Scale-up error: {error}")
@@ -197,6 +248,22 @@ class K3sAutoscaler:
             self.last_scale_up = datetime.now(timezone.utc)
 
             logger.info(f"Successfully scaled up by {len(successful_workers)} nodes in async mode")
+
+            # Emit scaling completed event
+            previous_workers = self.database.get_worker_count() - len(successful_workers)
+            new_workers = self.database.get_worker_count()
+            self._emit_event_sync(ScalingActionCompleted(
+                source="K3sAutoscaler",
+                data={
+                    "action": "scale_up",
+                    "count": len(successful_workers),
+                    "previous_workers": previous_workers,
+                    "new_workers": new_workers,
+                    "reason": decision.get("reason", "Resource pressure or pending pods"),
+                    "successful_workers": [w.node_name for w in successful_workers]
+                }
+            ))
+
             return True
 
         except Exception as e:
@@ -265,33 +332,77 @@ class K3sAutoscaler:
         # Check minimum nodes against validated node count
         logger.info(f"Node count check: k8s_nodes={actual_k8s_nodes}, docker={actual_docker_nodes}, actual={actual_nodes}, db_workers={len(db_workers)}, min={min_nodes}")
 
-        # Simple minimum check: allow scaling down to exactly min_nodes
-        if actual_nodes <= min_nodes:
-            logger.info(f"Cannot scale down: at minimum nodes (current={actual_nodes}, min={min_nodes})")
+        # Count permanent workers from Redis or DB
+        permanent_workers = 0
+        removable_workers = 0
+
+        # Try to get permanent workers from Redis first
+        if hasattr(self.database, 'redis') and self.database.redis:
+            try:
+                permanent_workers_list = self.database.redis.get("workers:permanent", deserialize=False)
+                if permanent_workers_list:
+                    permanent_workers_list = json.loads(permanent_workers_list)
+                    permanent_workers = len(permanent_workers_list)
+                    logger.info(f"Permanent workers from Redis: {permanent_workers_list}")
+            except Exception as e:
+                logger.warning(f"Failed to get permanent workers from Redis: {e}")
+
+        # Fallback to database or Docker counts
+        if db_workers and permanent_workers == 0:
+            permanent_workers = sum(1 for w in db_workers if w.node_name in settings.autoscaler.permanent_workers)
+            removable_workers = sum(1 for w in db_workers if w.node_name not in settings.autoscaler.permanent_workers)
+        elif actual_docker_nodes > 0 and permanent_workers == 0:
+            # Check Docker containers if DB is empty and Redis not available
+            containers = [c for c in self.docker_client.containers.list(all=True)
+                          if c.name and c.name.startswith(self.worker_prefix)]
+            permanent_workers = sum(1 for c in containers
+                                  if c.name in settings.autoscaler.permanent_workers)
+            removable_workers = actual_docker_nodes - permanent_workers
+
+        logger.info(f"Worker breakdown: permanent={permanent_workers}, removable={removable_workers}")
+
+        # Calculate effective minimum: 2 permanent workers + configured min_nodes
+        effective_min = 2 + min_nodes
+        logger.info(f"Effective minimum nodes: {effective_min} (2 permanent + {min_nodes} configurable)")
+
+        # Cannot scale down if we don't have removable workers
+        if removable_workers <= 0:
+            logger.info(f"Cannot scale down: no removable workers available (permanent={permanent_workers}, removable={removable_workers})")
             return False
 
-        # Emergency stop: only trigger if we're about to violate minimum
-        # This is just an extra safety check
-        if actual_nodes - count < min_nodes:
-            logger.error(f"EMERGENCY STOP: Cannot remove {count} nodes, would go below minimum (current={actual_nodes}, min={min_nodes})")
+        # Emergency stop: ensure we don't go below effective minimum
+        if actual_nodes - count < effective_min:
+            logger.error(f"EMERGENCY STOP: Cannot remove {count} nodes, would go below effective minimum (current={actual_nodes}, effective_min={effective_min})")
             logger.error("Manual intervention required - cluster at minimum capacity")
             return False
 
-        # Get workers (most recently launched first)
+        # Get workers sorted by launch time (oldest first for proper LIFO)
         workers = self.database.get_all_workers()
 
-        # If database is empty but we have Docker containers, create temporary worker objects
-        if not workers and actual_docker_nodes > 0:
-            logger.warning(f"Database has no workers but {actual_docker_nodes} Docker containers exist. Creating temporary worker objects.")
-            containers = [c for c in self.docker_client.containers.list(all=True)
-                          if c.name and c.name.startswith(self.worker_prefix)]
+        # Sort workers by launch time (oldest first)
+        workers.sort(key=lambda w: w.launched_at or datetime.min.replace(tzinfo=timezone.utc))
 
-            # Sort by creation time (newest first)
+        # Filter out permanent workers (configured in settings)
+        # These should never be removed
+        removable_workers = [w for w in workers if w.node_name not in settings.autoscaler.permanent_workers]
+
+        logger.info(f"Total workers: {len(workers)}, Removable workers: {len(removable_workers)}")
+        if removable_workers:
+            logger.info(f"Removable workers: {[w.node_name for w in removable_workers]}")
+
+        # If database is empty but we have Docker containers, create temporary worker objects
+        if not removable_workers and actual_docker_nodes > 0:
+            logger.warning(f"Database has no removable workers but {actual_docker_nodes} Docker containers exist. Creating temporary worker objects.")
+            containers = [c for c in self.docker_client.containers.list(all=True)
+                          if c.name and c.name.startswith(self.worker_prefix)
+                          and not c.name.endswith('-1') and not c.name.endswith('-2')]  # Skip permanent workers
+
+            # Sort by creation time (newest first for LIFO)
             containers.sort(key=lambda c: c.attrs['Created'], reverse=True)
 
             # Create temporary WorkerNode objects for removal
             from database import WorkerNode, NodeStatus
-            workers = []
+            removable_workers = []
             for container in containers[:count]:
                 worker = WorkerNode(
                     node_name=container.name,
@@ -301,9 +412,17 @@ class K3sAutoscaler:
                     launched_at=datetime.now(timezone.utc),
                     metadata={"synced_from_docker": True}
                 )
-                workers.append(worker)
+                removable_workers.append(worker)
 
-        workers_to_remove = workers[-count:] if count < len(workers) else workers
+        # LIFO: Select the most recently created workers (last in, first out)
+        # Since workers are sorted oldest first, we take from the end
+        workers_to_remove = removable_workers[-count:] if count < len(removable_workers) else removable_workers
+
+        if workers_to_remove:
+            logger.info(f"Workers selected for removal (LIFO): {[w.node_name for w in workers_to_remove]}")
+        else:
+            logger.warning("No workers available for removal")
+            return False
 
         try:
             # Initialize Docker client if not already done
@@ -345,6 +464,22 @@ class K3sAutoscaler:
                 self.last_scale_down = datetime.now(timezone.utc)
 
                 logger.info(f"Successfully scaled down by {len(successful_removals)} nodes in async mode")
+
+                # Emit scaling completed event
+                previous_workers = self.database.get_worker_count() + len(successful_removals)
+                new_workers = self.database.get_worker_count()
+                self._emit_event_sync(ScalingActionCompleted(
+                    source="K3sAutoscaler",
+                    data={
+                        "action": "scale_down",
+                        "count": len(successful_removals),
+                        "previous_workers": previous_workers,
+                        "new_workers": new_workers,
+                        "reason": decision.get("reason", "Underutilization"),
+                        "removed_workers": [w.node_name for w in successful_removals]
+                    }
+                ))
+
                 return True
             else:
                 logger.warning("No nodes were removed during scale down")
@@ -827,14 +962,117 @@ class K3sAutoscaler:
                     self.database.add_worker(worker_node)
                     logger.info(f"Added existing worker to database: {container_name}")
 
-            # Mark removed workers as REMOVED in database
+            # Delete removed workers from database
             for worker in db_workers:
                 if worker.node_name not in actual_containers:
-                    self.database.update_worker_status(worker.node_name, NodeStatus.REMOVED)
-                    logger.info(f"Marked worker as REMOVED in database: {worker.node_name}")
+                    # Actually delete the worker, not just mark as removed
+                    if self.database.workers.delete(worker.node_name):
+                        logger.info(f"Deleted stale worker from database: {worker.node_name}")
+                        # Also clear from Redis cache
+                        if hasattr(self.database, 'cache') and self.database.cache:
+                            self.database.cache.delete_worker(worker.node_name)
+                    else:
+                        # Fallback: just mark as removed
+                        self.database.update_worker_status(worker.node_name, NodeStatus.REMOVED)
+                        logger.warning(f"Could not delete worker, marked as REMOVED: {worker.node_name}")
 
             logger.info("Database sync with cluster completed")
+
+            # Emit cluster state synced event
+            self._emit_event_sync(ClusterStateSynced(
+                source="K3sAutoscaler",
+                data={
+                    "k8s_nodes": len(actual_containers),
+                    "docker_containers": len(actual_containers),
+                    "db_workers": len(db_workers),
+                    "sync_time": datetime.now(timezone.utc).isoformat()
+                }
+            ))
 
         except Exception as e:
             logger.error(f"Failed to sync database with cluster: {e}")
             # Don't fail initialization, just log the error
+
+    def _initialize_permanent_workers(self):
+        """Initialize permanent workers in Redis"""
+        logger.info(f"Initializing permanent workers in Redis: {settings.autoscaler.permanent_workers}")
+
+        try:
+            # Use Redis to store permanent worker information
+            if hasattr(self.database, 'redis') and self.database.redis:
+                # Store permanent workers list
+                self.database.redis.set("workers:permanent", json.dumps(settings.autoscaler.permanent_workers))
+
+                # Initialize worker counter to start after permanent workers
+                # This ensures new workers start from the configured start number
+                worker_counter_key = "workers:next_number"
+                if not self.database.redis.exists(worker_counter_key):
+                    self.database.redis.set(worker_counter_key, settings.autoscaler.worker_start_number - 1)
+                    logger.info(f"Initialized worker counter to start from {settings.autoscaler.worker_start_number}")
+
+                # Mark each permanent worker
+                for worker_name in settings.autoscaler.permanent_workers:
+                    self.database.redis.hset(f"workers:{worker_name}", "permanent", "true")
+                    self.database.redis.hset(f"workers:{worker_name}", "type", "permanent")
+                    self.database.redis.hset(f"workers:{worker_name}", "created_at",
+                                            datetime.now(timezone.utc).isoformat())
+
+                logger.info(f"Permanent workers initialized in Redis: {settings.autoscaler.permanent_workers}")
+                logger.info(f"Worker numbering will start from {settings.autoscaler.worker_start_number}")
+            else:
+                logger.warning("Redis not available, cannot store permanent workers")
+
+        except Exception as e:
+            logger.error(f"Failed to initialize permanent workers in Redis: {e}")
+
+    async def _ensure_event_bus_initialized(self):
+        """Ensure the event bus is initialized (lazy initialization)"""
+        if not self._event_bus_initialized:
+            try:
+                await self.event_bus.connect()
+                # Start event bus in background
+                asyncio.create_task(self.event_bus.start())
+                self._event_bus_initialized = True
+                logger.info("Event bus initialized and started")
+            except Exception as e:
+                logger.error(f"Failed to initialize event bus: {e}")
+                self._event_bus_initialized = False
+
+    async def _emit_event(self, event: Event):
+        """Emit an event to the event bus"""
+        try:
+            # Ensure event bus is initialized
+            await self._ensure_event_bus_initialized()
+            # Only emit if event bus is properly initialized
+            if self._event_bus_initialized:
+                await self.event_bus.publish(event)
+                logger.info(f"Event emitted: {event.event_type.value} - {event.event_id}")
+            else:
+                logger.warning(f"Event bus not initialized, skipping event emission: {event.event_type.value}")
+        except Exception as e:
+            logger.error(f"Failed to emit event {event.event_type}: {e}")
+
+    def _emit_event_sync(self, event: Event):
+        """Safely emit an event from a synchronous context"""
+        try:
+            logger.debug(f"Attempting to emit event: {event.event_type.value} - {event.event_id}")
+            # Try to get the current event loop
+            try:
+                loop = asyncio.get_running_loop()
+                # If there's a running loop, create a task
+                if loop.is_running():
+                    asyncio.create_task(self._emit_event(event))
+                else:
+                    # Loop exists but not running, use run_coroutine_threadsafe
+                    import threading
+                    if threading.current_thread() == threading.main_thread():
+                        # We're in the main thread, can run directly
+                        asyncio.run(self._emit_event(event))
+                    else:
+                        # We're in a different thread, schedule it
+                        asyncio.run_coroutine_threadsafe(self._emit_event(event), loop)
+            except RuntimeError:
+                # No running loop, create one temporarily
+                asyncio.run(self._emit_event(event))
+        except Exception as e:
+            logger.error(f"Failed to emit event {event.event_type}: {e}")

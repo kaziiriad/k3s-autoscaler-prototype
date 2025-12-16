@@ -46,7 +46,7 @@ class DatabaseManager:
         self.database_name = database_name or settings.mongodb.database_name
         self.redis_host = redis_host or settings.redis.host
         self.redis_port = redis_port or settings.redis.port
-        self.redis_db = redis_db or settings.redis.db
+        self.redis_db = redis_db or settings.redis.cache_db
         self.redis_password = redis_password or settings.redis.password
 
         # Repository instances
@@ -79,10 +79,7 @@ class DatabaseManager:
             )
 
             # Initialize RedisCache for faster persistence
-            redis_url = f"redis://{self.redis_host}:{self.redis_port}/{self.redis_db}"
-            if self.redis_password:
-                redis_url = f"redis://:{self.redis_password}@{self.redis_host}:{self.redis_port}/{self.redis_db}"
-            self.cache = RedisCache(redis_url)
+            self.cache = RedisCache()
 
             logger.info("Database manager connected successfully")
             return True
