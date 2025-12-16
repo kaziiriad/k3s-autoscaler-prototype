@@ -74,7 +74,7 @@ class RedisCache:
                     "container_name": worker.container_name,
                     "status": worker.status.value,
                     "launched_at": worker.launched_at.isoformat(),
-                    "last_seen": worker.last_seen.isoformat() if worker.last_seen else None,
+                    "last_seen": worker.last_seen.isoformat() if worker.last_seen else "",
                     "metadata": json.dumps(worker.metadata or {})
                 }
                 pipe.hset(worker_key, mapping=worker_data)
@@ -139,7 +139,7 @@ class RedisCache:
                 "container_name": worker.container_name,
                 "status": worker.status.value,
                 "launched_at": worker.launched_at.isoformat(),
-                "last_seen": worker.last_seen.isoformat() if worker.last_seen else None,
+                "last_seen": worker.last_seen.isoformat() if worker.last_seen else "",
                 "metadata": json.dumps(worker.metadata or {})
             }
 
