@@ -20,7 +20,7 @@ autoscaler:
   # Scaling limits
   limits:
     min_nodes: 2                 # Minimum number of worker nodes (1 master + 2 workers total)
-    max_nodes: 6                 # Maximum number of nodes (1 master + 5 workers total)
+    max_nodes: 7                # Maximum number of nodes (1 master + 19 workers total)
     scale_up_cooldown: 60        # Wait 60s after scale up
     scale_down_cooldown: 120     # Wait 2 minutes after scale down
 

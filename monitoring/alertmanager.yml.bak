@@ -1,0 +1,30 @@
+global:
+  smtp_smarthost: 'localhost:1025'
+  smtp_from: 'alertmanager@example.com'
+
+route:
+  group_by: ['alertname']
+  group_wait: 10s
+  group_interval: 10s
+  repeat_interval: 1h
+  receiver: 'web.hook'
+  routes:
+    - match:
+        severity: critical
+      receiver: 'critical'
+    - match:
+        severity: warning
+      receiver: 'warning'
+
+receivers:
+  - name: 'web.hook'
+    webhook_configs:
+      - url: 'http://autoscaler:8080/alerts'
+
+  - name: 'critical'
+    webhook_configs:
+      - url: 'http://autoscaler:8080/alerts?severity=critical'
+
+  - name: 'warning'
+    webhook_configs:
+      - url: 'http://autoscaler:8080/alerts?severity=warning'
