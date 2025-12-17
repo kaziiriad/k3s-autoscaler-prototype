@@ -1,0 +1,36 @@
+# Reconciliation Alert Rules
+groups:
+  - name: k3s_autoscaler_reconciliation
+    rules:
+      - alert: HighReconciliationIssues
+        expr: rate(autoscaler_reconciliation_issues_fixed_total[5m]) > 5
+        for: 2m
+        labels:
+          severity: warning
+          service: autoscaler
+          component: reconciliation
+        annotations:
+          summary: "High number of reconciliation issues being fixed"
+          description: "The autoscaler is fixing more than 5 issues per minute. This may indicate underlying system instability."
+
+      - alert: ReconciliationStalling
+        expr: increase(autoscaler_reconciliation_cycles_total[5m]) == 0
+        for: 10m
+        labels:
+          severity: critical
+          service: autoscaler
+          component: reconciliation
+        annotations:
+          summary: "Reconciliation cycles have stopped"
+          description: "No reconciliation cycles have been completed in the last 10 minutes. The reconciliation service may have stopped."
+
+      - alert: ReconciliationTooSlow
+        expr: histogram_quantile(0.95, autoscaler_reconciliation_duration_seconds_bucket) > 30
+        for: 5m
+        labels:
+          severity: warning
+          service: autoscaler
+          component: reconciliation
+        annotations:
+          summary: "Reconciliation is taking too long"
+          description: "95th percentile reconciliation duration is over 30 seconds, which may impact system performance."

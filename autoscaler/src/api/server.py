@@ -38,16 +38,18 @@ class ScalingRuleRequest(BaseModel):
 class APIServer:
     """FastAPI server for autoscaler endpoints"""
 
-    def __init__(self, autoscaler: K3sAutoscaler, config: Dict):
+    def __init__(self, autoscaler: K3sAutoscaler, config: Dict, service=None):
         """
         Initialize API server
 
         Args:
             autoscaler: K3sAutoscaler instance
             config: Configuration dictionary
+            service: AutoscalerService instance (optional)
         """
         self.autoscaler = autoscaler
         self.config = config
+        self.service = service
         self.app = FastAPI(
             title="K3s Autoscaler API",
             description="API for managing K3s cluster autoscaling",
@@ -335,6 +337,48 @@ class APIServer:
                 }
             except Exception as e:
                 logger.error(f"Error stopping autoscaler: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.get("/reconciliation/status")
+        async def get_reconciliation_status():
+            """Get reconciliation status"""
+            try:
+                # Check if reconciliation service is available through the service
+                if self.service and hasattr(self.service, 'reconciliation_service'):
+                    reconciliation_service = self.service.reconciliation_service
+                    if reconciliation_service:
+                        return reconciliation_service.get_status()
+
+                return {"error": "Reconciliation service not running"}
+            except Exception as e:
+                logger.error(f"Error getting reconciliation status: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.post("/reconciliation/trigger")
+        async def trigger_reconciliation():
+            """Manually trigger reconciliation"""
+            try:
+                # Check if reconciliation service is available
+                if self.service and hasattr(self.service, 'reconciliation_service'):
+                    reconciliation_service = self.service.reconciliation_service
+                    if reconciliation_service and hasattr(reconciliation_service, 'reconciler'):
+                        import asyncio
+                        await reconciliation_service.reconciler.reconcile()
+                        return {"message": "Reconciliation triggered successfully"}
+
+                return {"error": "Reconciliation service not running"}
+            except Exception as e:
+                logger.error(f"Error triggering reconciliation: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.post("/cleanup/orphaned")
+        async def cleanup_orphaned_nodes_endpoint():
+            """Clean up orphaned nodes immediately"""
+            try:
+                result = self.autoscaler.cleanup_orphaned_nodes()
+                return result
+            except Exception as e:
+                logger.error(f"Error in cleanup: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
 
     def run(self, host: str = "0.0.0.0", port: int = 8080):

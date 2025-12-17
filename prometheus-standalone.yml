@@ -1,0 +1,18 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "scaling_rules.yml"
+  - "reconciliation_alerts.yml"
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'autoscaler'
+    static_configs:
+      - targets: ['autoscaler:9091']
+    scrape_interval: 5s
+    metrics_path: /metrics

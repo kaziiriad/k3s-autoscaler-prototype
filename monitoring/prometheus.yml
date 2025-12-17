@@ -4,6 +4,7 @@ global:
 
 rule_files:
   - "scaling_rules.yml"
+  - "reconciliation_alerts.yml"
 
 scrape_configs:
   # Prometheus itself

@@ -164,6 +164,7 @@ services:
       - grafana-data:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana/k3s-cluster-dashboard.json:/var/lib/grafana/dashboards/k3s-cluster-dashboard.json:ro
+      - ./monitoring/grafana/dashboards/reconciliation-dashboard.json:/var/lib/grafana/dashboards/reconciliation-dashboard.json:ro
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_USERS_ALLOW_SIGN_UP=false
@@ -175,7 +176,7 @@ services:
 
   # Autoscaler Service
   autoscaler:
-    image: autoscaler:redis-persistence
+    image: autoscaler:reconciliation-metrics-fixed
     ports:
       - "8080:8080"
       - "9091:9091"
@@ -193,6 +194,10 @@ services:
       # Reduced cooldowns for faster testing
       - SCALE_UP_COOLDOWN=10
       - SCALE_DOWN_COOLDOWN=15
+      - RECONCILIATION_ENABLED=true
+      - RECONCILIATION_INTERVAL=60  # seconds
+      - STARTUP_RECONCILIATION=true
+
     networks:
       - k3s-network
     depends_on:
@@ -200,6 +205,11 @@ services:
       - mongodb
       - redis
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/reconciliation/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   # Node Exporter for the host
   node-exporter:

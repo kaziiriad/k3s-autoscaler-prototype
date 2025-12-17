@@ -10,7 +10,7 @@ import time
 import signal
 import logging
 from typing import Dict, Optional
-from prometheus_client import start_http_server, Gauge, Counter
+from prometheus_client import start_http_server, Gauge, Counter, Histogram
 from datetime import datetime
 
 # Add src to path for absolute imports
@@ -21,6 +21,7 @@ from core.logging_config import setup_logging, get_logger
 
 # Import modular components
 from core.autoscaler import K3sAutoscaler
+from core.reconciliation import ReconciliationService
 from database import DatabaseManager
 from api.server import APIServer
 from config import Settings, settings
@@ -32,6 +33,8 @@ PENDING_PODS = Gauge('autoscaler_pending_pods', 'Number of pending pods')
 SCALE_UP_EVENTS = Counter('autoscaler_scale_up_events_total', 'Total scale-up events')
 SCALE_DOWN_EVENTS = Counter('autoscaler_scale_down_events_total', 'Total scale-down events')
 ERRORS = Counter('autoscaler_errors_total', 'Total errors', ['type'])
+
+# Reconciliation metrics are defined locally in reconciliation.py to avoid duplication
 
 
 class AutoscalerService:
@@ -64,7 +67,10 @@ class AutoscalerService:
         self.autoscaler = K3sAutoscaler(self.config, self.database)
 
         # Initialize API server
-        self.api_server = APIServer(self.autoscaler, self.config)
+        self.api_server = APIServer(self.autoscaler, self.config, service=self)
+
+        # Initialize reconciliation service
+        self.reconciliation_service = None
 
         # Setup signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -144,6 +150,20 @@ class AutoscalerService:
         api_thread.daemon = True
         api_thread.start()
         self.logger.info("API server started on :8080")
+
+        # Start reconciliation service in background
+        import asyncio
+        async def start_reconciliation():
+            self.reconciliation_service = ReconciliationService(self.autoscaler)
+            await self.reconciliation_service.start()
+
+        # Run reconciliation in background
+        reconciliation_thread = threading.Thread(
+            target=lambda: asyncio.run(start_reconciliation())
+        )
+        reconciliation_thread.daemon = True
+        reconciliation_thread.start()
+        self.logger.info("Reconciliation service started")
 
         # Main autoscaling loop
         interval = self.config['autoscaler']['check_interval']

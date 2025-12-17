@@ -68,6 +68,18 @@ class K3sAutoscaler:
 
         logger.info("K3s Autoscaler initialized with database support, async operations, and event-driven architecture")
 
+        # Perform startup reconciliation to ensure data integrity
+        logger.info("Performing startup reconciliation...")
+        from core.startup_reconciliation import StartupReconciler
+
+        startup_reconciler = StartupReconciler(self)
+        reconciliation_results = startup_reconciler.reconcile_on_startup()
+
+        if reconciliation_results.get("errors"):
+            logger.error(f"Startup reconciliation errors: {reconciliation_results['errors']}")
+
+        logger.info(f"Startup reconciliation complete: {len(reconciliation_results['actions'])} actions")
+
         # Sync database with actual cluster state on startup
         self._sync_database_with_cluster()
 
@@ -717,21 +729,27 @@ class K3sAutoscaler:
                 self.docker_client.ping()
                 logger.info("Docker client initialized")
 
-            # Find the next available worker number
-            existing_workers = []
-            containers = self.docker_client.containers.list(all=True)
-            for container in containers:
-                if container.name and container.name.startswith(self.worker_prefix):
-                    try:
-                        num = int(container.name.split('-')[-1])
-                        existing_workers.append(num)
-                    except:
-                        pass
+            # Use Redis atomic increment for worker numbering (prevents race conditions)
+            from database.redis_client import AutoscalerRedisClient
+            from config.settings import settings
 
-            next_num = max(existing_workers) + 1 if existing_workers else 3
+            redis_client = AutoscalerRedisClient(
+                host=settings.redis.host,
+                port=settings.redis.port,
+                db=settings.redis.cache_db,
+                password=settings.redis.password
+            )
+
+            # Initialize counter if needed
+            worker_counter_key = "workers:next_number"
+            if not redis_client.exists(worker_counter_key):
+                redis_client.set(worker_counter_key, settings.autoscaler.worker_start_number - 1)
+
+            # Atomically get next worker number
+            next_num = redis_client.increment(worker_counter_key, 1)
             node_name = f"{self.worker_prefix}-{next_num}"
 
-            logger.info(f"Creating worker node: {node_name}")
+            logger.info(f"Creating worker node: {node_name} (allocated from Redis counter)")
 
             # Create the container
             container = self.docker_client.containers.run(
