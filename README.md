@@ -1,6 +1,6 @@
 # K3s Docker Autoscaler
 
-A production-grade autoscaler that dynamically adds/removes Docker containers running k3s worker nodes based on Prometheus metrics. Features atomic scaling operations, comprehensive logging, and robust error handling.
+A production-grade autoscaler that dynamically adds/removes Docker containers running k3s worker nodes based on Prometheus metrics. Features atomic scaling operations, comprehensive logging, event-driven architecture, and state reconciliation for robust error handling.
 
 ## Architecture
 
@@ -20,11 +20,13 @@ A production-grade autoscaler that dynamically adds/removes Docker containers ru
 - ✅ **Type Safety**: Pydantic models for metrics and configuration
 - ✅ **Rollback Mechanisms**: Automatic rollback on failed operations
 - ✅ **Health Monitoring**: Built-in health checks and metrics endpoints
-- ✅ **Event-Driven Architecture**: Event bus for reactive scaling with retry logic
+- ✅ **Event-Driven Architecture**: Production-ready event bus with automatic recovery
+- ✅ **State Reconciliation**: Continuous synchronization across all data stores
 - ✅ **Redis Persistence**: All state stored in Redis for consistency across restarts
 - ✅ **LIFO Scaling**: Last-In-First-Out scaling with permanent worker protection
 - ✅ **Concurrent Operations**: Async scaling manager for parallel container operations
 - ✅ **Namespace Support**: Workers launch in proper Docker namespace (prototype)
+- ✅ **Event Bus Health Monitoring**: Automatic health checks and recovery with exponential backoff
 
 ## Quick Start
 
@@ -102,14 +104,33 @@ Edit `autoscaler/config/config-with-db.yaml` to adjust:
 ## Architecture Improvements (December 2025)
 
 ### Event-Driven Architecture
-The autoscaler now uses an event bus pattern for reactive operations:
-- **Event Bus**: Central message hub for all scaling events
+The autoscaler now uses a production-ready event bus pattern for reactive operations:
+- **Improved Event Bus**: Central message hub with automatic recovery and health monitoring
+- **Safe Event Emission**: Thread-safe event publishing from synchronous code
 - **Event Handlers**: Specialized handlers for different event types
   - `ClusterStateSynced`: Syncs cluster state with database
   - `NodeHealthDegraded`: Handles unhealthy node detection
   - `OptimalStateTrigger`: Prevents unnecessary scaling oscillations
   - `PendingPodsDetected`: Fast response to pod scheduling needs
-- **Retry Logic**: Automatic retry with exponential backoff for failed events
+  - `ScalingCompleted`: Handles post-scaling operations
+  - `MinimumNodeEnforcement`: Ensures minimum worker count
+- **Resilient Event Processing**:
+  - Automatic retry with exponential backoff (max 5 retries)
+  - Event queuing for sync-to-async bridge
+  - Timeout protection (5s for publish, 10s for initialization)
+  - Graceful degradation when event bus unavailable
+
+### State Reconciliation System
+- **Startup Reconciliation**: Automatic state sync on service start
+- **Continuous Reconciliation**: Runs every 60 seconds to maintain consistency
+- **Multi-Source Sync**: Synchronizes Docker, Kubernetes, Redis, and MongoDB
+- **Issue Detection & Fixing**: Automatically detects and fixes:
+  - Stale Redis/MongoDB entries
+  - Orphaned Kubernetes nodes
+  - Missing database records
+  - Status mismatches
+  - Worker counter inconsistencies
+- **Reconciliation Monitoring**: Prometheus metrics for cycles, duration, and issues fixed
 
 ### Enhanced State Management
 - **Redis-First Strategy**: All state stored in Redis for consistency
@@ -185,6 +206,16 @@ For **Scale Down**:
 - `POST /cycle` - Trigger manual scaling cycle
 - `POST /stop` - Stop the autoscaler
 
+### Reconciliation Endpoints
+- `GET /reconciliation/status` - View reconciliation system status
+  ```bash
+  curl http://localhost:8080/reconciliation/status | python3 -m json.tool
+  ```
+- `POST /reconciliation/trigger` - Manually trigger a reconciliation cycle
+  ```bash
+  curl -X POST http://localhost:8080/reconciliation/trigger
+  ```
+
 ### Prometheus Metrics
 - `autoscaler_scaling_decisions_total` - Total scaling decisions
 - `autoscaler_current_nodes` - Current node count
@@ -192,6 +223,11 @@ For **Scale Down**:
 - `autoscaler_scale_up_events_total` - Scale-up events
 - `autoscaler_scale_down_events_total` - Scale-down events
 - `autoscaler_errors_total` - Error count by type
+
+#### Reconciliation Metrics
+- `autoscaler_reconciliation_cycles_total` - Total reconciliation cycles
+- `autoscaler_reconciliation_duration_seconds` - Time taken for reconciliation (histogram)
+- `autoscaler_reconciliation_issues_fixed_total` - Issues fixed by reconciliation (by type)
 
 ## Monitoring Stack
 
@@ -202,12 +238,18 @@ The system automatically deploys:
 - **Custom Autoscaler Metrics**: Exposed on port 9091
 
 ### Grafana Dashboard
-Pre-configured dashboard includes:
-- Cluster capacity and utilization
-- Individual node performance
-- Scaling events timeline
-- Resource allocation vs usage
-- Pod scheduling status
+Pre-configured dashboards include:
+- **Cluster Dashboard**:
+  - Cluster capacity and utilization
+  - Individual node performance
+  - Scaling events timeline
+  - Resource allocation vs usage
+  - Pod scheduling status
+- **Reconciliation Dashboard**:
+  - Reconciliation rate over time
+  - Duration percentiles (50th, 95th, 99th)
+  - Issues fixed by type (pie chart)
+  - Issues fixed over time (stacked graph)
 
 ## Test Workloads
 
@@ -332,6 +374,27 @@ Dry-run mode: Skipping actual scaling execution
 
    # Verify worker breakdown
    docker logs prototype-autoscaler-1 | grep "Worker breakdown"
+   ```
+
+7. **Reconciliation not working**
+   ```bash
+   # Check reconciliation status
+   curl -s http://localhost:8080/reconciliation/status | python3 -m json.tool
+
+   # Trigger manual reconciliation
+   curl -X POST http://localhost:8080/reconciliation/trigger
+
+   # Check reconciliation metrics
+   curl -s http://localhost:9091/metrics | grep reconciliation
+   ```
+
+8. **Event bus issues**
+   ```bash
+   # Check autoscaler logs for event bus errors
+   docker logs prototype-autoscaler-1 | grep -i "event bus"
+
+   # Verify event system is initialized
+   docker logs prototype-autoscaler-1 | grep "Background services started"
    ```
 
 ### Debug Mode
