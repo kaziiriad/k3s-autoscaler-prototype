@@ -25,6 +25,21 @@ from core.reconciliation import ReconciliationService
 from database import DatabaseManager
 from api.server import APIServer
 from config import Settings, settings
+# Import event metrics to register them with Prometheus
+from events.event_metrics import (
+    EVENT_BUS_PUBLISHED_TOTAL,
+    EVENT_BUS_PROCESSED_TOTAL,
+    EVENT_BUS_QUEUE_SIZE,
+    EVENT_BUS_SUBSCRIBERS,
+    EVENT_BUS_HANDLER_DURATION,
+    EVENT_BUS_ERRORS_TOTAL,
+    EVENT_BUS_HEALTH,
+    EVENT_BUS_EVENTS_RATE,
+    OPTIMAL_STATE_EVENTS,
+    SCALING_EVENTS,
+    CLUSTER_STATE_EVENTS,
+    RESOURCE_PRESSURE_EVENTS
+)
 
 # Prometheus metrics
 SCALING_DECISIONS = Counter('autoscaler_scaling_decisions_total', 'Total scaling decisions', ['decision'])

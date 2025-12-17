@@ -8,6 +8,7 @@ import asyncio
 import logging
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone
+from .event_metrics import metrics_collector
 
 logger = logging.getLogger(__name__)
 
@@ -117,25 +118,74 @@ class ImprovedEventBusIntegration:
 
     async def publish(self, event):
         """Publish event with fallback if event bus not initialized"""
+        event_type_str = event.event_type.value if hasattr(event.event_type, 'value') else str(event.event_type)
+
         if not self._initialized or not self.event_bus:
             logger.warning(
-                f"Event bus not initialized, logging event instead: {event.event_type}"
+                f"Event bus not initialized, logging event instead: {event_type_str}"
             )
+            # Record failed publish
+            metrics_collector.record_event_published(event_type_str, False)
+            metrics_collector.record_error('not_initialized', 'event_bus')
             # Fallback: just log it
-            logger.info(f"EVENT: {event.event_type.value} - {event.data}")
+            logger.info(f"EVENT: {event_type_str} - {event.data}")
             return False
 
         try:
-            return await asyncio.wait_for(
+            success = await asyncio.wait_for(
                 self.event_bus.publish(event),
                 timeout=5.0
             )
+            # Record successful publish
+            metrics_collector.record_event_published(event_type_str, success)
+
+            # Record specific event type metrics
+            if hasattr(event, 'data'):
+                self._record_specific_event_metrics(event)
+
+            return success
         except asyncio.TimeoutError:
-            logger.error(f"Event publish timeout: {event.event_type}")
+            logger.error(f"Event publish timeout: {event_type_str}")
+            metrics_collector.record_event_published(event_type_str, False)
+            metrics_collector.record_error('timeout', 'event_bus')
             return False
         except Exception as e:
             logger.error(f"Failed to publish event: {e}")
+            metrics_collector.record_event_published(event_type_str, False)
+            metrics_collector.record_error('publish_failed', 'event_bus')
             return False
+
+    def _record_specific_event_metrics(self, event):
+        """Record metrics for specific event types"""
+        try:
+            event_type = str(event.event_type.value if hasattr(event.event_type, 'value') else event.event_type)
+            data = event.data or {}
+
+            # Record optimal state events
+            if 'optimal' in event_type.lower():
+                reason = data.get('reason', 'unknown')
+                metrics_collector.record_optimal_state_event(reason)
+
+            # Record scaling events
+            elif 'scaling' in event_type.lower() or 'scale_' in event_type.lower():
+                action = data.get('action', 'unknown')
+                status = data.get('status', 'completed')
+                metrics_collector.record_scaling_event(action, status)
+
+            # Record cluster state events
+            elif 'cluster' in event_type.lower():
+                sync_type = data.get('sync_type', 'full')
+                status = data.get('status', 'success')
+                metrics_collector.record_cluster_state_event(sync_type, status)
+
+            # Record resource pressure events
+            elif 'pressure' in event_type.lower() or 'resource' in event_type.lower():
+                resource_type = data.get('resource_type', 'cpu')
+                pressure_level = data.get('pressure_level', 'medium')
+                metrics_collector.record_resource_pressure(resource_type, pressure_level)
+
+        except Exception as e:
+            logger.warning(f"Failed to record specific event metrics: {e}")
 
     async def shutdown(self):
         """Graceful shutdown"""
@@ -169,13 +219,32 @@ class SafeEventEmitter:
         """Background loop to publish queued events"""
         while True:
             try:
+                # Update queue size metric
+                metrics_collector.update_queue_size('emit_queue', self._emit_queue.qsize())
+
                 event = await self._emit_queue.get()
                 if event is None:  # Shutdown signal
                     break
 
-                await self.event_bus.publish(event)
+                # Record queue size after getting event
+                metrics_collector.update_queue_size('emit_queue', self._emit_queue.qsize())
+
+                # Time the publish operation
+                import time
+                start_time = time.time()
+
+                success = await self.event_bus.publish(event)
+
+                # Record processing metrics
+                duration = time.time() - start_time
+                event_type = str(event.event_type.value if hasattr(event.event_type, 'value') else event.event_type)
+
+                # Note: We don't have handler info here, so use 'background_publisher' as handler name
+                metrics_collector.record_event_processed(event_type, 'background_publisher', success, duration)
+
             except Exception as e:
                 logger.error(f"Background publisher error: {e}")
+                metrics_collector.record_error('background_publish_error', 'event_emitter')
 
     def emit_sync(self, event):
         """
@@ -229,6 +298,7 @@ class EventBusHealthMonitor:
         """Check event bus health"""
         if not self.event_bus._initialized:
             logger.warning("Event bus not initialized")
+            metrics_collector.update_health('event_bus', False)
             return
 
         try:
@@ -249,6 +319,9 @@ class EventBusHealthMonitor:
             if success:
                 self.consecutive_failures = 0
                 self.last_publish_time = datetime.now(timezone.utc)
+                metrics_collector.update_health('event_bus', True)
+                # Also update emitter health
+                metrics_collector.update_health('event_emitter', True)
             else:
                 self._handle_failure()
 
@@ -259,6 +332,11 @@ class EventBusHealthMonitor:
     def _handle_failure(self):
         """Handle health check failure"""
         self.consecutive_failures += 1
+
+        # Update health metrics
+        metrics_collector.update_health('event_bus', False)
+        metrics_collector.update_health('event_emitter', False)
+        metrics_collector.record_error('health_check_failed', 'health_monitor')
 
         if self.consecutive_failures >= self.max_failures:
             logger.critical(

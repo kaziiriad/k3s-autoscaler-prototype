@@ -327,6 +327,31 @@ class RedisClient:
             logger.error(f"Failed to check set membership for {key}: {e}")
             return False
 
+    def scard(self, key: str) -> int:
+        """Get size of set (number of members)"""
+        try:
+            redis_key = self._make_key(key)
+            return self.client.scard(redis_key)
+        except Exception as e:
+            logger.error(f"Failed to get set size for {key}: {e}")
+            return 0
+
+    def smembers(self, key: str) -> set:
+        """Get all set members"""
+        try:
+            redis_key = self._make_key(key)
+            members = self.client.smembers(redis_key)
+            result = set()
+            for member in members:
+                try:
+                    result.add(json.loads(member))
+                except (json.JSONDecodeError, TypeError):
+                    result.add(member)
+            return result
+        except Exception as e:
+            logger.error(f"Failed to get set members for {key}: {e}")
+            return set()
+
     def clear_pattern(self, pattern: str) -> int:
         """Clear keys matching pattern"""
         try:

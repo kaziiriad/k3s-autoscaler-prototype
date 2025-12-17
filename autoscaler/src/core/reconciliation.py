@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 try:
     from database import DatabaseManager, WorkerNode, NodeStatus
     from kubernetes import client
+    from events.base import EventType, Event
 except ImportError:
     # Fallback for direct execution
     import sys
@@ -91,6 +92,7 @@ class StateReconciler:
             "stale_redis": 0,
             "stale_mongo": 0,
             "orphaned_k8s": 0,
+            "orphaned_containers": 0,
             "missing_db": 0,
             "status_fixes": 0,
             "counter_fixes": 0
@@ -264,6 +266,7 @@ class StateReconciler:
             "stale_redis": [],      # In Redis but not in Docker
             "stale_mongo": [],      # In MongoDB but not in Docker
             "orphaned_k8s": [],     # In K8s but not in Docker
+            "orphaned_containers": [], # Docker containers not in any system
             "missing_db": [],       # In Docker but not in DB
             "status_mismatches": [] # Wrong status in Redis/MongoDB
         }
@@ -315,6 +318,9 @@ class StateReconciler:
     async def _fix_inconsistencies(self, inconsistencies: Dict, state: Dict):
         """Fix detected inconsistencies"""
         logger.info("Fixing inconsistencies...")
+
+        # Collect actions for event reporting
+        actions_taken = []
         
         # 1. Remove stale Redis entries
         for worker_name in inconsistencies["stale_redis"]:
@@ -388,8 +394,37 @@ class StateReconciler:
                 if self.database.update_worker_status(worker_name, NodeStatus.READY):
                     self.issues_fixed["status_fixes"] += 1
                     logger.info(f"✓ Fixed status for: {worker_name}")
+                    actions_taken.append(f"Updated status for {worker_name}")
             except Exception as e:
                 logger.error(f"Failed to fix status {worker_name}: {e}")
+
+        # 6. Publish reconciliation event
+        if actions_taken or any(self.issues_fixed.values()):
+            try:
+                # Try to get the event bus if available
+                from events.improved_event_bus import get_event_bus
+                event_bus = get_event_bus()
+
+                if event_bus:
+                    # Create reconciliation completed event
+                    event = Event(
+                        event_type=EventType.RECONCILIATION_COMPLETED,
+                        data={
+                            "reconciliation_id": self.reconciliation_count,
+                            "issues_fixed": self.issues_fixed.copy(),
+                            "actions_taken": actions_taken,
+                            "inconsistencies_found": {
+                                key: len(value) for key, value in inconsistencies.items()
+                            },
+                            "timestamp": datetime.now(timezone.utc).isoformat()
+                        }
+                    )
+                    await event_bus.publish(event)
+                    logger.info(f"Published reconciliation event with {len(actions_taken)} actions")
+            except ImportError:
+                logger.debug("Event system not available, skipping event publication")
+            except Exception as e:
+                logger.warning(f"Failed to publish reconciliation event: {e}")
     
     async def _verify_worker_counter(self, state: Dict) -> bool:
         """Verify and fix worker counter. Returns True if counter was fixed."""

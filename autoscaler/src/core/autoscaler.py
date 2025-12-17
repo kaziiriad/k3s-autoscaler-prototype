@@ -345,38 +345,81 @@ class K3sAutoscaler:
         # Check minimum nodes against validated node count
         logger.info(f"Node count check: k8s_nodes={actual_k8s_nodes}, docker={actual_docker_nodes}, actual={actual_nodes}, db_workers={len(db_workers)}, min={min_nodes}")
 
-        # Count permanent workers from Redis or DB
+        # Count permanent, removable, and configurable workers from Redis sets
         permanent_workers = 0
         removable_workers = 0
+        configurable_workers = 0
+        all_workers_count = 0
 
-        # Try to get permanent workers from Redis first
+        # Try to get worker counts from Redis sets first
         if hasattr(self.database, 'redis') and self.database.redis:
             try:
-                permanent_workers_list = self.database.redis.get("workers:permanent", deserialize=False)
-                if permanent_workers_list:
-                    permanent_workers_list = json.loads(permanent_workers_list)
-                    permanent_workers = len(permanent_workers_list)
-                    logger.info(f"Permanent workers from Redis: {permanent_workers_list}")
-            except Exception as e:
-                logger.warning(f"Failed to get permanent workers from Redis: {e}")
+                # Get counts from Redis sets
+                permanent_workers = self.database.redis.scard("workers:permanent")
+                removable_workers = self.database.redis.scard("workers:removable")
+                all_workers_count = self.database.redis.scard("workers:all")
 
-        # Fallback to database or Docker counts
-        if db_workers and permanent_workers == 0:
-            permanent_workers = sum(1 for w in db_workers if w.node_name in settings.autoscaler.permanent_workers)
-            removable_workers = sum(1 for w in db_workers if w.node_name not in settings.autoscaler.permanent_workers)
-        elif actual_docker_nodes > 0 and permanent_workers == 0:
-            # Check Docker containers if DB is empty and Redis not available
-            containers = [c for c in self.docker_client.containers.list(all=True)
-                          if c.name and c.name.startswith(self.worker_prefix)]
-            permanent_workers = sum(1 for c in containers
-                                  if c.name in settings.autoscaler.permanent_workers)
-            removable_workers = actual_docker_nodes - permanent_workers
+                # Calculate configurable workers (those that aren't permanent)
+                configurable_workers = max(0, all_workers_count - permanent_workers)
+
+                # Get actual lists for logging
+                permanent_list = list(self.database.redis.smembers("workers:permanent"))
+                removable_list = list(self.database.redis.smembers("workers:removable"))
+
+                logger.info(f"Worker counts from Redis sets:")
+                logger.info(f"  Permanent: {permanent_workers} {permanent_list}")
+                logger.info(f"  Removable: {removable_workers} {removable_list}")
+                logger.info(f"  Configurable: {configurable_workers}")
+
+            except Exception as e:
+                logger.warning(f"Failed to get worker counts from Redis sets: {e}")
+                # Fallback to old JSON method
+                try:
+                    permanent_workers_list = self.database.redis.get("workers:permanent", deserialize=False)
+                    if permanent_workers_list:
+                        permanent_workers_list = json.loads(permanent_workers_list)
+                        permanent_workers = len(permanent_workers_list)
+                        logger.info(f"Permanent workers from Redis JSON: {permanent_workers_list}")
+                except Exception as e2:
+                    logger.warning(f"Failed to get permanent workers from Redis JSON: {e2}")
+
+        # Fallback to database or Docker counts if Redis failed
+        if permanent_workers == 0:
+            if db_workers:
+                permanent_workers = sum(1 for w in db_workers if w.node_name in settings.autoscaler.permanent_workers)
+                removable_workers = sum(1 for w in db_workers if w.node_name not in settings.autoscaler.permanent_workers)
+                configurable_workers = removable_workers
+            elif actual_docker_nodes > 0:
+                # Check Docker containers if DB is empty and Redis not available
+                containers = [c for c in self.docker_client.containers.list(all=True)
+                              if c.name and c.name.startswith(self.worker_prefix)]
+                permanent_workers = sum(1 for c in containers
+                                      if c.name in settings.autoscaler.permanent_workers)
+                removable_workers = actual_docker_nodes - permanent_workers
+                configurable_workers = removable_workers
 
         logger.info(f"Worker breakdown: permanent={permanent_workers}, removable={removable_workers}")
 
-        # Calculate effective minimum: 2 permanent workers + configured min_nodes
-        effective_min = 2 + min_nodes
-        logger.info(f"Effective minimum nodes: {effective_min} (2 permanent + {min_nodes} configurable)")
+        # Calculate effective minimum: the greater of permanent workers or configured min_nodes
+        # Add configurable workers as buffer for scaling
+        effective_min = max(permanent_workers, min_nodes)
+
+        # Log detailed breakdown
+        logger.info(f"Node count breakdown:")
+        logger.info(f"  Total nodes: {actual_nodes} (including master)")
+        logger.info(f"  Worker nodes: {actual_nodes - 1} (excluding master)")
+        logger.info(f"  Permanent workers: {permanent_workers}")
+        logger.info(f"  Removable workers: {removable_workers}")
+        logger.info(f"  Configurable workers: {configurable_workers}")
+        logger.info(f"  Min nodes (config): {min_nodes}")
+        logger.info(f"  Effective minimum: {effective_min}")
+
+        # Can we scale down?
+        can_scale_down = removable_workers > 0 and (actual_nodes - 1) > effective_min
+        if can_scale_down:
+            logger.info(f"Can scale down: {removable_workers} removable available")
+        else:
+            logger.info(f"Cannot scale down: need at least {effective_min} workers, have {actual_nodes - 1}")
 
         # Cannot scale down if we don't have removable workers
         if removable_workers <= 0:

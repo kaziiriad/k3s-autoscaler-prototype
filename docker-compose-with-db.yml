@@ -165,6 +165,7 @@ services:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana/k3s-cluster-dashboard.json:/var/lib/grafana/dashboards/k3s-cluster-dashboard.json:ro
       - ./monitoring/grafana/dashboards/reconciliation-dashboard.json:/var/lib/grafana/dashboards/reconciliation-dashboard.json:ro
+      - ./monitoring/grafana/dashboards/event-dashboard.json:/var/lib/grafana/dashboards/event-dashboard.json:ro
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_USERS_ALLOW_SIGN_UP=false
@@ -176,7 +177,7 @@ services:
 
   # Autoscaler Service
   autoscaler:
-    image: autoscaler:event-bus-fixed
+    image: autoscaler:reconciliation-events-v2
     ports:
       - "8080:8080"
       - "9091:9091"

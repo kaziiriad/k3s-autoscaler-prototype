@@ -57,6 +57,12 @@ class EventType(str, Enum):
     CONFIGURATION_CHANGED = "ConfigurationChanged"
     SCALING_RULE_ADDED = "ScalingRuleAdded"
     SCALING_RULE_MODIFIED = "ScalingRuleModified"
+
+    # Reconciliation Events
+    RECONCILIATION_COMPLETED = "ReconciliationCompleted"
+    RECONCILIATION_STARTED = "ReconciliationStarted"
+    STATE_INCONSISTENCY_DETECTED = "StateInconsistencyDetected"
+    STATE_INCONSISTENCY_FIXED = "StateInconsistencyFixed"
     SCALING_RULE_DELETED = "ScalingRuleDeleted"
 
     # Health Check Events
