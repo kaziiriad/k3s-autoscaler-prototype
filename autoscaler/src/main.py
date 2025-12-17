@@ -153,17 +153,21 @@ class AutoscalerService:
 
         # Start reconciliation service in background
         import asyncio
-        async def start_reconciliation():
+        async def start_background_services():
+            # Start reconciliation
             self.reconciliation_service = ReconciliationService(self.autoscaler)
             await self.reconciliation_service.start()
 
-        # Run reconciliation in background
-        reconciliation_thread = threading.Thread(
-            target=lambda: asyncio.run(start_reconciliation())
+            # Initialize event system
+            await self.autoscaler.initialize_events()
+
+        # Run background services
+        background_thread = threading.Thread(
+            target=lambda: asyncio.run(start_background_services())
         )
-        reconciliation_thread.daemon = True
-        reconciliation_thread.start()
-        self.logger.info("Reconciliation service started")
+        background_thread.daemon = True
+        background_thread.start()
+        self.logger.info("Background services started (reconciliation + events)")
 
         # Main autoscaling loop
         interval = self.config['autoscaler']['check_interval']
@@ -214,6 +218,20 @@ class AutoscalerService:
     def cleanup(self):
         """Cleanup resources"""
         try:
+            # Shutdown event system gracefully
+            if self.autoscaler and hasattr(self.autoscaler, 'shutdown_events'):
+                import asyncio
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        # Create task for shutdown
+                        asyncio.create_task(self.autoscaler.shutdown_events())
+                    else:
+                        # Run shutdown synchronously
+                        loop.run_until_complete(self.autoscaler.shutdown_events())
+                except Exception as e:
+                    self.logger.error(f"Error shutting down event system: {e}")
+
             if self.autoscaler:
                 self.autoscaler.cleanup()
             if self.database:

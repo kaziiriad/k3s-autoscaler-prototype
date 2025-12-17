@@ -176,7 +176,7 @@ services:
 
   # Autoscaler Service
   autoscaler:
-    image: autoscaler:reconciliation-metrics-fixed
+    image: autoscaler:event-bus-fixed
     ports:
       - "8080:8080"
       - "9091:9091"

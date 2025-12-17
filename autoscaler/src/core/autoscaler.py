@@ -18,7 +18,6 @@ from .scaling import ScalingEngine
 from .async_scaling import AsyncScalingManager
 from core.logging_config import log_separator, log_section
 from events import (
-    EventBus,
     Event,
     ScalingActionCompleted,
     ClusterStateSynced,
@@ -59,9 +58,11 @@ class K3sAutoscaler:
         # Initialize default state
         self.worker_prefix = settings.autoscaler.worker_prefix
 
-        # Initialize event bus for event-driven architecture
-        self.event_bus = EventBus()
-        self._event_bus_initialized = False
+        # Initialize event system (will be properly initialized in async context)
+        self.event_bus_integration = None
+        self.event_emitter = None
+        self.health_monitor = None
+        self._events_initialized = False
 
         # Track optimal state emissions (backup for Redis)
         self._last_optimal_state_emission = None
@@ -1043,54 +1044,66 @@ class K3sAutoscaler:
         except Exception as e:
             logger.error(f"Failed to initialize permanent workers in Redis: {e}")
 
-    async def _ensure_event_bus_initialized(self):
-        """Ensure the event bus is initialized (lazy initialization)"""
-        if not self._event_bus_initialized:
-            try:
-                await self.event_bus.connect()
-                # Start event bus in background
-                asyncio.create_task(self.event_bus.start())
-                self._event_bus_initialized = True
-                logger.info("Event bus initialized and started")
-            except Exception as e:
-                logger.error(f"Failed to initialize event bus: {e}")
-                self._event_bus_initialized = False
+    async def initialize_events(self):
+        """Initialize event system - call this during startup"""
+        if self._events_initialized:
+            return True
 
-    async def _emit_event(self, event: Event):
-        """Emit an event to the event bus"""
+        logger.info("Initializing improved event system...")
+
         try:
-            # Ensure event bus is initialized
-            await self._ensure_event_bus_initialized()
-            # Only emit if event bus is properly initialized
-            if self._event_bus_initialized:
-                await self.event_bus.publish(event)
-                logger.info(f"Event emitted: {event.event_type.value} - {event.event_id}")
-            else:
-                logger.warning(f"Event bus not initialized, skipping event emission: {event.event_type.value}")
+            from events.improved_event_bus import (
+                ImprovedEventBusIntegration,
+                SafeEventEmitter,
+                EventBusHealthMonitor
+            )
+
+            # Create event bus integration
+            self.event_bus_integration = ImprovedEventBusIntegration(self)
+
+            # Initialize event bus
+            success = await self.event_bus_integration.initialize()
+            if not success:
+                logger.error("Event bus initialization failed, continuing without events")
+                return False
+
+            # Create event emitter for sync code
+            self.event_emitter = SafeEventEmitter(self.event_bus_integration)
+            await self.event_emitter.start_background_publisher()
+
+            # Start health monitoring
+            self.health_monitor = EventBusHealthMonitor(self.event_bus_integration)
+            asyncio.create_task(self.health_monitor.start())
+
+            self._events_initialized = True
+            logger.info("✓ Improved event system initialized")
+            return True
+
         except Exception as e:
-            logger.error(f"Failed to emit event {event.event_type}: {e}")
+            logger.error(f"Failed to initialize event system: {e}")
+            self._events_initialized = False
+            return False
+
+    def emit_event_safe(self, event):
+        """
+        Safely emit event from any context (sync or async)
+        USE THIS in your autoscaler code
+        """
+        if self.event_emitter:
+            self.event_emitter.emit_sync(event)
+        else:
+            # Fallback: just log
+            logger.info(f"EVENT (no emitter): {event.event_type.value}")
+
+    async def shutdown_events(self):
+        """Shutdown event system gracefully"""
+        if self.event_emitter:
+            await self.event_emitter.shutdown()
+
+        if self.event_bus_integration:
+            await self.event_bus_integration.shutdown()
+        self._events_initialized = False
 
     def _emit_event_sync(self, event: Event):
-        """Safely emit an event from a synchronous context"""
-        try:
-            logger.debug(f"Attempting to emit event: {event.event_type.value} - {event.event_id}")
-            # Try to get the current event loop
-            try:
-                loop = asyncio.get_running_loop()
-                # If there's a running loop, create a task
-                if loop.is_running():
-                    asyncio.create_task(self._emit_event(event))
-                else:
-                    # Loop exists but not running, use run_coroutine_threadsafe
-                    import threading
-                    if threading.current_thread() == threading.main_thread():
-                        # We're in the main thread, can run directly
-                        asyncio.run(self._emit_event(event))
-                    else:
-                        # We're in a different thread, schedule it
-                        asyncio.run_coroutine_threadsafe(self._emit_event(event), loop)
-            except RuntimeError:
-                # No running loop, create one temporarily
-                asyncio.run(self._emit_event(event))
-        except Exception as e:
-            logger.error(f"Failed to emit event {event.event_type}: {e}")
+        """Legacy method - redirects to emit_event_safe"""
+        self.emit_event_safe(event)
