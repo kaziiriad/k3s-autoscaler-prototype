@@ -177,7 +177,7 @@ services:
 
   # Autoscaler Service
   autoscaler:
-    image: autoscaler:reconciliation-events-v2
+    image: autoscaler:fix-cordoned-nodes
     ports:
       - "8080:8080"
       - "9091:9091"

@@ -3,7 +3,6 @@
 Metrics collector module for gathering cluster and node metrics
 """
 
-import logging
 import requests
 from typing import Dict, Any, Optional
 from kubernetes import client
@@ -11,6 +10,7 @@ from kubernetes import config as k8s_config
 from database import DatabaseManager
 from models.metrics import NodeMetrics, ClusterMetrics, ClusterCapacity
 from core.logging_config import get_logger
+from kubernetes.client import ApiClient
 
 logger = get_logger(__name__)
 
@@ -79,7 +79,6 @@ class MetricsCollector:
                             Configuration.set_default(configuration)
                     except (ImportError, AttributeError):
                         # Fallback for newer versions - use ApiClient
-                        from kubernetes.client import ApiClient
                         api_client = ApiClient()
                         if hasattr(api_client, 'configuration'):
                             configuration = api_client.configuration
@@ -158,18 +157,30 @@ class MetricsCollector:
                     logger.debug(f"Skipping control-plane node: {node_name}")
                     continue
 
-                worker_nodes.append(node)
-                logger.info(f"Found worker node: {node_name}")
+                # Skip cordoned nodes (being removed)
+                if hasattr(node, 'spec') and node.spec.unschedulable:
+                    logger.info(f"Skipping cordoned node: {node_name}")
+                    continue
 
-                # Check if node is ready
+                # Check if node is ready before counting it
+                node_ready = False
                 if node.status.conditions:
                     for condition in node.status.conditions:
                         if condition.type == "Ready" and condition.status == "True":
+                            node_ready = True
                             ready_nodes += 1
-                            logger.debug(f"Node {node_name} is ready")
                             break
+                    if not node_ready:
+                        # Node has conditions but is not Ready
+                        logger.info(f"Skipping NotReady node: {node_name}")
+                        continue
                 else:
-                    logger.warning(f"Node {node_name} has no conditions")
+                    # Node has no conditions, treat as not ready
+                    logger.warning(f"Node {node_name} has no conditions, skipping")
+                    continue
+
+                worker_nodes.append(node)
+                logger.info(f"Found ready worker node: {node_name}")
 
             logger.info(f"Control-plane nodes: {control_plane_nodes}")
             logger.info(f"Worker nodes: {[n.metadata.name for n in worker_nodes]}")

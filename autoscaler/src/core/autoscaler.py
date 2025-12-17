@@ -12,7 +12,7 @@ import json
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timezone
 from database import DatabaseManager, WorkerNode, NodeStatus, ScalingEventType
-from config.settings import settings
+from config.settings import settings, REDIS_KEYS
 from .metrics import MetricsCollector
 from .scaling import ScalingEngine
 from .async_scaling import AsyncScalingManager
@@ -66,6 +66,10 @@ class K3sAutoscaler:
 
         # Track optimal state emissions (backup for Redis)
         self._last_optimal_state_emission = None
+
+        # Initialize last scaling timestamps to prevent datetime comparison errors
+        self.last_scale_up = None
+        self.last_scale_down = None
 
         logger.info("K3s Autoscaler initialized with database support, async operations, and event-driven architecture")
 
@@ -355,16 +359,16 @@ class K3sAutoscaler:
         if hasattr(self.database, 'redis') and self.database.redis:
             try:
                 # Get counts from Redis sets
-                permanent_workers = self.database.redis.scard("workers:permanent")
-                removable_workers = self.database.redis.scard("workers:removable")
-                all_workers_count = self.database.redis.scard("workers:all")
+                permanent_workers = self.database.redis.scard(REDIS_KEYS['WORKERS_PERMANENT'])
+                removable_workers = self.database.redis.scard(REDIS_KEYS['WORKERS_REMOVABLE'])
+                all_workers_count = self.database.redis.scard(REDIS_KEYS['WORKERS_ALL'])
 
                 # Calculate configurable workers (those that aren't permanent)
                 configurable_workers = max(0, all_workers_count - permanent_workers)
 
                 # Get actual lists for logging
-                permanent_list = list(self.database.redis.smembers("workers:permanent"))
-                removable_list = list(self.database.redis.smembers("workers:removable"))
+                permanent_list = list(self.database.redis.smembers(REDIS_KEYS['WORKERS_PERMANENT']))
+                removable_list = list(self.database.redis.smembers(REDIS_KEYS['WORKERS_REMOVABLE']))
 
                 logger.info(f"Worker counts from Redis sets:")
                 logger.info(f"  Permanent: {permanent_workers} {permanent_list}")
@@ -1062,14 +1066,14 @@ class K3sAutoscaler:
         try:
             # Use Redis to store permanent worker information
             if hasattr(self.database, 'redis') and self.database.redis:
-                # Store permanent workers list
-                self.database.redis.set("workers:permanent", json.dumps(settings.autoscaler.permanent_workers))
+                # Store permanent workers list as a Redis set
+                if settings.autoscaler.permanent_workers:
+                    self.database.redis.set_add(REDIS_KEYS['WORKERS_PERMANENT'], *settings.autoscaler.permanent_workers)
 
                 # Initialize worker counter to start after permanent workers
                 # This ensures new workers start from the configured start number
-                worker_counter_key = "workers:next_number"
-                if not self.database.redis.exists(worker_counter_key):
-                    self.database.redis.set(worker_counter_key, settings.autoscaler.worker_start_number - 1)
+                if not self.database.redis.exists(REDIS_KEYS['WORKER_COUNTER']):
+                    self.database.redis.set(REDIS_KEYS['WORKER_COUNTER'], settings.autoscaler.worker_start_number)
                     logger.info(f"Initialized worker counter to start from {settings.autoscaler.worker_start_number}")
 
                 # Mark each permanent worker
