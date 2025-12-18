@@ -441,8 +441,8 @@ class StateReconciler:
             # Get Redis counter
             redis_counter = int(self.database.redis.get("workers:next_number") or 0)
 
-            # Counter should be at least max_num + 1
-            correct_counter = max_num + 1
+            # Counter should be at least max_num + 1, but NEVER less than current counter
+            correct_counter = max(max_num + 1, redis_counter)
 
             if redis_counter < correct_counter:
                 logger.warning(
@@ -454,13 +454,13 @@ class StateReconciler:
                 logger.info(f"✓ Fixed worker counter: {correct_counter}")
                 return True
             else:
-                logger.debug(f"Worker counter is correct: {redis_counter}")
+                logger.debug(f"Worker counter is correct: {redis_counter} (max worker: {max_num})")
                 return False
 
         except Exception as e:
             logger.error(f"Failed to verify worker counter: {e}")
-            return False
-    
+            return False 
+           
     def get_status(self) -> Dict:
         """Get reconciliation status"""
         return {

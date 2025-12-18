@@ -265,11 +265,19 @@ class StartupReconciler:
         return actions
     
     def _fix_worker_counter(self, state: Dict) -> Optional[str]:
-        """Fix the worker counter in Redis"""
+        """Fix the worker counter in Redis - ensure it NEVER decreases"""
         try:
             # Get highest worker number from Docker
             max_num = 0
             for worker_name in state["docker_containers"].keys():
+                try:
+                    num = int(worker_name.split('-')[-1])
+                    max_num = max(max_num, num)
+                except (ValueError, IndexError):
+                    pass
+            
+            # Also check database for potentially higher numbers
+            for worker_name in state["database_workers"].keys():
                 try:
                     num = int(worker_name.split('-')[-1])
                     max_num = max(max_num, num)
@@ -282,14 +290,21 @@ class StartupReconciler:
             # Get current counter from Redis
             current_counter = int(self.database.redis.get("workers:next_number") or 0)
             
+            # CRITICAL: Counter should NEVER decrease
             if current_counter < correct_counter:
                 logger.warning(
-                    f"Worker counter is wrong: {current_counter} "
-                    f"(should be {correct_counter})"
+                    f"Worker counter is too low: {current_counter} "
+                    f"(should be at least {correct_counter} based on existing workers)"
                 )
                 self.database.redis.set("workers:next_number", correct_counter)
-                logger.info(f"✓ Fixed worker counter: {correct_counter}")
+                logger.info(f"✓ Fixed worker counter: {current_counter} → {correct_counter}")
                 return f"Fixed worker counter: {current_counter} → {correct_counter}"
+            elif current_counter > correct_counter:
+                logger.info(
+                    f"Worker counter is ahead of existing workers: {current_counter} > {correct_counter}. "
+                    f"This is normal if workers were created and removed. Keeping current value."
+                )
+                return None
             else:
                 logger.info(f"Worker counter is correct: {current_counter}")
                 return None

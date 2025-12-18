@@ -177,7 +177,7 @@ services:
 
   # Autoscaler Service
   autoscaler:
-    image: autoscaler:fix-cordoned-nodes
+    image: custom-autoscaler:latest
     ports:
       - "8080:8080"
       - "9091:9091"

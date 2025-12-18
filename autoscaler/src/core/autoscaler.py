@@ -2,7 +2,7 @@
 """
 Core autoscaler logic module
 """
-
+import json  # Import at function level to avoid circular imports
 import logging
 import time
 import docker
@@ -17,6 +17,7 @@ from .metrics import MetricsCollector
 from .scaling import ScalingEngine
 from .async_scaling import AsyncScalingManager
 from core.logging_config import log_separator, log_section
+import concurrent.futures
 from events import (
     Event,
     ScalingActionCompleted,
@@ -188,6 +189,43 @@ class K3sAutoscaler:
         action = decision['action']
         count = decision.get('count', 1)
 
+        # Check if scaling operation already in progress
+        if hasattr(self.database, 'redis') and self.database.redis:
+            lock_key = REDIS_KEYS['SCALING_LOCK']
+
+            # Check if lock exists and when it was created
+            if self.database.redis.exists(lock_key):
+                # Get the lock value to check timestamp
+                lock_value = self.database.redis.get(lock_key, deserialize=False)
+                if lock_value:
+                    try:
+                        lock_data = json.loads(lock_value)
+                        lock_time = datetime.fromisoformat(lock_data.get('timestamp', ''))
+                        # If lock is older than 2 minutes, force release it
+                        if (datetime.now(timezone.utc) - lock_time).total_seconds() > 120:
+                            logger.warning(f"Found stale scaling lock (created {lock_time}), force-releasing")
+                            self.database.redis.delete(lock_key)
+                        else:
+                            logger.info("Scaling operation already in progress, skipping cycle")
+                            return False
+                    except (json.JSONDecodeError, ValueError):
+                        # If we can't parse the lock, just delete it
+                        logger.warning("Invalid scaling lock format, deleting")
+                        self.database.redis.delete(lock_key)
+                else:
+                    # Old format lock, just delete it
+                    logger.warning("Found old format scaling lock, deleting")
+                    self.database.redis.delete(lock_key)
+
+            # Set lock with timestamp and 60s expiry to prevent infinite locks
+            lock_data = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "action": action,
+                "count": count
+            }
+            self.database.redis.set(lock_key, json.dumps(lock_data), expire=60)
+            logger.info(f"Acquired scaling operation lock for {action}")
+
         try:
             if action == "scale_up":
                 return self._scale_up(count, decision)
@@ -199,10 +237,38 @@ class K3sAutoscaler:
         except Exception as e:
             logger.error(f"Failed to execute scaling {action}: {e}")
             return False
+        finally:
+            # Always release the lock
+            if hasattr(self.database, 'redis') and self.database.redis:
+                lock_key = REDIS_KEYS['SCALING_LOCK']
+                self.database.redis.delete(lock_key)
+                logger.info("Released scaling operation lock")
 
     def _scale_up(self, count: int, decision: Dict[str, Any]) -> bool:
         """Scale up by adding worker nodes using async operations"""
         logger.info(f"Scaling up by {count} nodes (async mode)")
+    # Defensive check: Verify counter is not corrupted
+        try:
+            if hasattr(self.database, 'redis') and self.database.redis:
+                current_counter = int(self.database.redis.get("workers:next_number") or settings.autoscaler.worker_start_number)
+                
+                # Get all existing workers
+                all_workers = self.database.get_all_workers()
+                if all_workers:
+                    max_existing = max(
+                        int(w.node_name.split('-')[-1]) 
+                        for w in all_workers 
+                        if w.node_name.split('-')[-1].isdigit()
+                    )
+                    
+                    if current_counter <= max_existing:
+                        logger.warning(
+                            f"Counter corruption detected: counter={current_counter}, "
+                            f"max_existing={max_existing}. Fixing..."
+                        )
+                        self.database.redis.set("workers:next_number", max_existing + 1)
+        except Exception as e:
+            logger.warning(f"Could not verify counter: {e}")
 
         # Check both cooldowns to prevent rapid oscillation
         if self.database.is_cooldown_active("scale_up"):
@@ -233,10 +299,7 @@ class K3sAutoscaler:
 
             # Run async scaling operation using existing event loop
             try:
-                # Try to get current event loop
-                loop = asyncio.get_running_loop()
                 # If we're in an async context (FastAPI), we need to run in a thread
-                import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     future = executor.submit(
                         lambda: asyncio.run(self.async_scaling.scale_up_concurrent(count, self.docker_client, self.database))
@@ -436,11 +499,57 @@ class K3sAutoscaler:
             logger.error("Manual intervention required - cluster at minimum capacity")
             return False
 
-        # Get workers sorted by launch time (oldest first for proper LIFO)
+        # Get workers sorted for LIFO removal
         workers = self.database.get_all_workers()
 
+        # Filter out permanent workers first
+        removable_workers = [w for w in workers if w.node_name not in settings.autoscaler.permanent_workers]
+
+        logger.info(f"Total workers: {len(workers)}, Removable workers: {len(removable_workers)}")
+        if removable_workers:
+            logger.info(f"Removable workers: {[w.node_name for w in removable_workers]}")
+
+        # IMPROVED LIFO: Sort by worker number extracted from name (most reliable)
+        def get_worker_number(worker):
+            """Extract worker number from worker name for LIFO sorting"""
+            try:
+                # Extract number from name like "k3s-worker-5" -> 5
+                return int(worker.node_name.split('-')[-1])
+            except (ValueError, IndexError):
+                # Fallback to timestamp if number extraction fails
+                if worker.launched_at:
+                    if worker.launched_at.tzinfo is None:
+                        return worker.launched_at.replace(tzinfo=timezone.utc).timestamp()
+                    return worker.launched_at.timestamp()
+                return 0  # Unknown workers go first
+
+        # Sort by worker number ascending (oldest numbers first)
+        removable_workers.sort(key=get_worker_number)
+        
+        logger.info(f"Workers sorted for LIFO removal: {[f'{w.node_name}({get_worker_number(w)})' for w in removable_workers]}")
+
+        # LIFO: Take the HIGHEST numbered workers (most recently created)
+        # Since sorted ascending, take from the end
+        workers_to_remove = removable_workers[-count:] if count < len(removable_workers) else removable_workers
+
+        if workers_to_remove:
+            logger.info(f"Workers selected for LIFO removal: {[w.node_name for w in workers_to_remove]}")
+        else:
+            logger.warning("No workers available for removal")
+            return False
+        
         # Sort workers by launch time (oldest first)
-        workers.sort(key=lambda w: w.launched_at or datetime.min.replace(tzinfo=timezone.utc))
+        # Handle None values and ensure consistent timezone awareness
+        def safe_launched_at(worker):
+            if worker.launched_at is None:
+                # Use epoch time for workers without launch time
+                return datetime(1970, 1, 1, tzinfo=timezone.utc)
+            # Ensure timezone awareness
+            if worker.launched_at.tzinfo is None:
+                return worker.launched_at.replace(tzinfo=timezone.utc)
+            return worker.launched_at
+
+        workers.sort(key=safe_launched_at)
 
         # Filter out permanent workers (configured in settings)
         # These should never be removed
@@ -498,9 +607,8 @@ class K3sAutoscaler:
             # Run async scale-down operation using existing event loop
             try:
                 # Try to get current event loop
-                loop = asyncio.get_running_loop()
+                # loop = asyncio.get_running_loop()
                 # If we're in an async context (FastAPI), we need to run in a thread
-                import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     future = executor.submit(
                         lambda: asyncio.run(self.async_scaling.scale_down_concurrent(workers_to_remove, self.docker_client, self.database))

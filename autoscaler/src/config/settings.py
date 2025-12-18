@@ -21,6 +21,21 @@ try:
 except ImportError:
     pass  # python-dotenv not installed, that's OK
 
+# Redis key constants
+REDIS_KEYS = {
+    'WORKER_COUNTER': 'workers:next_number',
+    'WORKERS_PERMANENT': 'autoscaler:workers:permanent',
+    'WORKERS_REMOVABLE': 'autoscaler:workers:removable',
+    'WORKERS_ALL': 'autoscaler:workers:all',
+    'SCALING_OPERATIONS': 'async_scaling:active_operations',
+    'SCALING_HISTORY': 'async_scaling:operation_history',
+    'SCALING_LOCK': 'scaling:operation_in_progress',
+    'COOLDOWN_SCALE_UP': 'cooldown:scale_up',
+    'COOLDOWN_SCALE_DOWN': 'cooldown:scale_down',
+    'EVENT_QUEUE': 'events:queue',
+    'EVENT_SUBSCRIPTIONS': 'events:subscriptions'
+}
+
 class MongoDBSettings(BaseSettings):
     """MongoDB configuration settings"""
     url: str = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
@@ -98,6 +113,7 @@ class AutoscalerSettings(BaseSettings):
     worker_prefix: str = os.getenv("AUTOSCALER_WORKER_PREFIX", "k3s-worker")
     permanent_workers: list = os.getenv("AUTOSCALER_PERMANENT_WORKERS", "k3s-worker-1,k3s-worker-2").split(",")
     worker_start_number: int = int(os.getenv("AUTOSCALER_WORKER_START_NUMBER", "3"))
+    worker_verification_timeout: int = int(os.getenv("AUTOSCALER_WORKER_VERIFICATION_TIMEOUT", "240"))
 
     # Token
     k3s_token: str = os.getenv("K3S_TOKEN", "mysupersecrettoken12345")

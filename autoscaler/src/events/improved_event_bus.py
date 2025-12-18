@@ -8,7 +8,13 @@ import asyncio
 import logging
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone
-from .event_metrics import metrics_collector
+from .event_metrics import (
+    metrics_collector,
+    OPTIMAL_STATE_EVENTS,
+    SCALING_EVENTS,
+    CLUSTER_STATE_EVENTS,
+    RESOURCE_PRESSURE_EVENTS
+)
 
 logger = logging.getLogger(__name__)
 

@@ -13,7 +13,8 @@ import docker
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timezone
 from database import WorkerNode, NodeStatus
-from config.settings import settings
+from config.settings import settings, REDIS_KEYS
+from database.redis_client import AutoscalerRedisClient
 
 logger = logging.getLogger(__name__)
 
@@ -41,15 +42,13 @@ class AsyncScalingManager:
         )
 
         # Track operations in Redis instead of memory
-        from config.settings import settings
-        from database.redis_client import AutoscalerRedisClient
-        self.redis = AutoscalerRedisClient(
+        self.redis_client = AutoscalerRedisClient(
             host=settings.redis.host,
             port=settings.redis.port,
             db=settings.redis.cache_db,
             password=settings.redis.password
         )
-
+        self.worker_counter_key = REDIS_KEYS['WORKER_COUNTER']
         logger.info(f"AsyncScalingManager initialized with max_workers={max_workers}")
 
     async def scale_up_concurrent(self, count: int, docker_client, database) -> Tuple[List[WorkerNode], List[str]]:
@@ -66,6 +65,7 @@ class AsyncScalingManager:
         """
         logger.info(f"Starting concurrent scale-up of {count} nodes")
         start_time = time.time()
+        verification_timeout = getattr(settings.autoscaler, 'worker_verification_timeout', 240)
 
         # Create semaphore to limit concurrent Docker operations
         semaphore = asyncio.Semaphore(self.max_workers)
@@ -118,7 +118,8 @@ class AsyncScalingManager:
             verification_tasks = []
 
             for worker in successful_workers:
-                task = self._verify_node_with_kubernetes_async(worker, timeout=120)
+
+                task = self._verify_node_with_kubernetes_async(worker, timeout=settings.autoscaler.worker_verification_timeout)
                 verification_tasks.append(task)
 
             verification_results = await asyncio.gather(*verification_tasks, return_exceptions=True)
@@ -241,24 +242,32 @@ class AsyncScalingManager:
                     error_messages.append(error)
 
         # Wait for Kubernetes nodes to be removed
+        logger.info(f"DEBUG: Scale-down check - successful_removals={len(successful_removals)}, has_k8s_api={hasattr(self, 'k8s_api')}")
+
         if successful_removals and hasattr(self, 'k8s_api'):
+            logger.info(f"DEBUG: Waiting for Kubernetes node removal for {len(successful_removals)} workers")
             wait_tasks = []
             for worker in successful_removals:
+                logger.info(f"DEBUG: Creating wait task for {worker.node_name}")
                 task = self._wait_for_kubernetes_removal_async(worker)
                 wait_tasks.append(task)
 
             wait_results = await asyncio.gather(*wait_tasks, return_exceptions=True)
+            logger.info(f"DEBUG: Wait results returned for {len(wait_results)} workers")
 
             # Update database with verified removals
             db_updates = []
             for worker, verified in zip(successful_removals, wait_results):
+                logger.info(f"DEBUG: Worker {worker.node_name} verified: {verified}")
                 if isinstance(verified, dict) and verified.get('removed', False):
                     db_updates.append(worker)
 
             # Update database concurrently
             if db_updates:
+                logger.info(f"DEBUG: Calling database.remove_worker for {len(db_updates)} workers")
                 db_tasks = []
                 for worker in db_updates:
+                    logger.info(f"DEBUG: Scheduling DB removal for {worker.node_name}")
                     task = asyncio.get_event_loop().run_in_executor(
                         self.thread_pool,
                         database.remove_worker,
@@ -267,11 +276,19 @@ class AsyncScalingManager:
                     db_tasks.append(task)
 
                 db_results = await asyncio.gather(*db_tasks, return_exceptions=True)
+                logger.info(f"DEBUG: DB removal results: {len(db_results)}")
 
                 # Log any database errors
                 for worker, result in zip(db_updates, db_results):
                     if isinstance(result, Exception):
                         error_messages.append(f"DB removal error for {worker.node_name}: {str(result)}")
+            else:
+                logger.info("DEBUG: No workers verified as removed for database updates")
+        else:
+            if not successful_removals:
+                logger.info("DEBUG: No successful removals to wait for")
+            if not hasattr(self, 'k8s_api'):
+                logger.warning("DEBUG: Kubernetes API not available, skipping node removal wait")
 
         elapsed = time.time() - start_time
         logger.info(f"Concurrent scale-down completed in {elapsed:.2f}s: "
@@ -332,8 +349,14 @@ class AsyncScalingManager:
             return True
 
         except Exception as e:
-            logger.error(f"Failed to drain node {worker.node_name}: {e}")
-            return False
+            # Check if this is a 404 error (node doesn't exist)
+            error_str = str(e)
+            if "404" in error_str or "Not Found" in error_str:
+                logger.info(f"Node {worker.node_name} not found in Kubernetes, treating as already drained")
+                return True  # Node doesn't exist, so it's already "drained"
+            else:
+                logger.error(f"Failed to drain node {worker.node_name}: {e}")
+                return False
 
     async def _wait_for_kubernetes_removal_async(self, worker: WorkerNode, timeout: int = 60) -> Dict[str, Any]:
         """Asynchronously wait for Kubernetes node removal"""
@@ -361,50 +384,51 @@ class AsyncScalingManager:
     def _create_worker_node_sync(self, worker_id: int, docker_client) -> Optional[WorkerNode]:
         """Synchronous worker creation (runs in thread pool)"""
         try:
-            from config.settings import settings
-            from database.redis_client import AutoscalerRedisClient
-
-            # Use Redis INCRBY for efficient worker numbering
-            redis_client = AutoscalerRedisClient(
-                host=settings.redis.host,
-                port=settings.redis.port,
-                db=settings.redis.cache_db,
-                password=settings.redis.password
-            )
-
-            # Get next worker number using Redis atomic increment
-            # This ensures no race conditions when multiple workers are created concurrently
-            worker_counter_key = "workers:next_number"
-
-            # Initialize counter if it doesn't exist
-            if not redis_client.exists(worker_counter_key):
-                redis_client.set(worker_counter_key, settings.autoscaler.worker_start_number - 1)
-
-            # Atomically increment to get next number
-            next_num = redis_client.increment(worker_counter_key, 1)
-            node_name = f"{settings.autoscaler.worker_prefix}-{next_num}"
-
-            logger.info(f"Allocated worker number {next_num} from Redis counter")
+            from config.settings import settings, REDIS_KEYS
+            
+            # CRITICAL FIX: Atomically increment FIRST to reserve the number
+            # This prevents race conditions in concurrent scaling
+            if not self.redis_client.exists(self.worker_counter_key):
+                self.redis_client.set(self.worker_counter_key, settings.autoscaler.worker_start_number - 1)
+            
+            # Atomically get and increment - this reserves the number
+            worker_num = int(self.redis_client.increment(self.worker_counter_key))
+            node_name = f"{settings.autoscaler.worker_prefix}-{worker_num}"
+            
+            logger.info(f"Reserved worker number {worker_num}, creating {node_name}")
 
             # Create the container
-            container = docker_client.containers.run(
-                image=settings.docker.image,
-                name=node_name,
-                detach=True,
-                privileged=True,
-                environment={
-                    'K3S_URL': f"https://{settings.kubernetes.server_host or 'k3s-master'}:6443",
-                    'K3S_TOKEN': settings.autoscaler.k3s_token,
-                    'K3S_NODE_NAME': node_name,
-                    'K3S_WITH_NODE_ID': 'true'
-                },
-                volumes={
-                    f'/tmp/k3s-{node_name}': {'bind': '/var/lib/rancher/k3s', 'mode': 'rw'},
-                },
-                network=settings.docker.network,
-                restart_policy={'Name': 'always'},
-                labels={'com.docker.compose.project': 'prototype'}
-            )
+            try:
+                container = docker_client.containers.run(
+                    image=settings.docker.image,
+                    name=node_name,
+                    detach=True,
+                    privileged=True,
+                    environment={
+                        'K3S_URL': f"https://{settings.kubernetes.server_host or 'k3s-master'}:6443",
+                        'K3S_TOKEN': settings.autoscaler.k3s_token,
+                        'K3S_NODE_NAME': node_name,
+                        'K3S_WITH_NODE_ID': 'true'
+                    },
+                    volumes={
+                        f'/tmp/k3s-{node_name}': {'bind': '/var/lib/rancher/k3s', 'mode': 'rw'},
+                    },
+                    network=settings.docker.network,
+                    restart_policy={'Name': 'always'},
+                    labels={'com.docker.compose.project': 'prototype'}
+                )
+                
+                logger.info(f"Successfully created worker {node_name} with reserved number {worker_num}")
+                
+            except Exception as e:
+                logger.error(f"Failed to create container for {node_name}: {e}")
+                # Don't decrement counter - skip this number to avoid reuse
+                logger.warning(f"Worker number {worker_num} will be skipped due to creation failure")
+                return None
+
+            # Add worker to Redis sets
+            self.redis_client.set_add(REDIS_KEYS['WORKERS_ALL'], node_name)
+            self.redis_client.set_add(REDIS_KEYS['WORKERS_REMOVABLE'], node_name)
 
             worker_node = WorkerNode(
                 node_name=node_name,
@@ -416,7 +440,8 @@ class AsyncScalingManager:
                     "created_by": "autoscaler",
                     "container_image": settings.docker.image,
                     "network": settings.docker.network,
-                    "worker_id": worker_id
+                    "worker_id": worker_id,
+                    "worker_number": worker_num  # Store the number for reference
                 }
             )
 
@@ -425,15 +450,46 @@ class AsyncScalingManager:
         except Exception as e:
             logger.error(f"Failed to create worker node: {e}")
             return None
-
+        
     def _remove_worker_container_sync(self, worker: WorkerNode, docker_client) -> bool:
         """Synchronous container removal (runs in thread pool)"""
         try:
+            from config.settings import REDIS_KEYS
+            # Check if worker is permanent before removal
+            permanent_workers = self.redis_client.set_members(REDIS_KEYS['WORKERS_PERMANENT'])
+            if worker.node_name in permanent_workers:
+                logger.info(f"Worker {worker.node_name} is marked as permanent; skipping removal.")
+                return False
+
+            # Remove the container
             container = docker_client.containers.get(worker.container_id)
             container.remove(force=True)
+            logger.info(f"Successfully removed container: {worker.node_name}")
+
+            # Update Redis sets - remove from all workers and removable sets
+            self.redis_client.set_remove(REDIS_KEYS['WORKERS_ALL'], worker.node_name)
+            self.redis_client.set_remove(REDIS_KEYS['WORKERS_REMOVABLE'], worker.node_name)
+
+            # Also remove the individual worker hash entry
+            worker_hash_key = f"worker:{worker.node_name}"
+            self.redis_client.delete(worker_hash_key)
+            logger.debug(f"Deleted worker hash entry: {worker_hash_key}")
+
+            # Note: We don't decrement the worker counter as it should always increase
+            # to ensure unique worker numbers even after removals
+
             return True
         except docker.errors.NotFound:
-            logger.warning(f"Container not found for {worker.node_name}")
+            logger.warning(f"Container not found for {worker.node_name}, treating as successful removal")
+            # Still update Redis sets to clean up
+            self.redis_client.set_remove(REDIS_KEYS['WORKERS_ALL'], worker.node_name)
+            self.redis_client.set_remove(REDIS_KEYS['WORKERS_REMOVABLE'], worker.node_name)
+
+            # Also remove the individual worker hash entry
+            worker_hash_key = f"worker:{worker.node_name}"
+            self.redis_client.delete(worker_hash_key)
+            logger.debug(f"Deleted worker hash entry: {worker_hash_key}")
+
             return True
         except Exception as e:
             logger.error(f"Failed to remove container {worker.node_name}: {e}")
@@ -448,7 +504,9 @@ class AsyncScalingManager:
             patch_body = {"spec": {"unschedulable": True}}
             self.k8s_api.patch_node(name=node_name, body=patch_body)
         except Exception as e:
-            logger.warning(f"Could not mark node {node_name} as unschedulable: {e}")
+            # Re-raise the exception so the caller can handle it appropriately
+            # This allows _drain_node_async to distinguish between different error types
+            raise e
 
     def set_kubernetes_api(self, k8s_api):
         """Set Kubernetes API client for async operations"""
@@ -456,30 +514,32 @@ class AsyncScalingManager:
 
     def _add_active_operation(self, operation_id: str, operation_data: dict):
         """Add an active operation to Redis"""
-        self.redis.hset("async_scaling:active_operations", operation_id, json.dumps(operation_data))
-        self.redis.expire("async_scaling:active_operations", 3600)  # Expire after 1 hour
+        self.redis_client.hset(REDIS_KEYS['SCALING_OPERATIONS'], operation_id, json.dumps(operation_data))
+        self.redis_client.expire(REDIS_KEYS['SCALING_OPERATIONS'], 3600)  # Expire after 1 hour
 
     def _remove_active_operation(self, operation_id: str):
         """Remove an active operation from Redis"""
-        self.redis.hdel("async_scaling:active_operations", operation_id)
+        self.redis_client.hdel(REDIS_KEYS['SCALING_OPERATIONS'], operation_id)
 
     def _get_active_operations(self) -> dict:
         """Get all active operations from Redis"""
         operations = {}
-        for op_id, op_data in self.redis.hgetall("async_scaling:active_operations").items():
+        for op_id, op_data in self.redis_client.hgetall(REDIS_KEYS['SCALING_OPERATIONS']).items():
             operations[op_id.decode()] = json.loads(op_data.decode())
         return operations
 
     def _add_operation_history(self, operation_data: dict):
         """Add operation to history in Redis"""
-        history_key = "async_scaling:operation_history"
-        self.redis.lpush(history_key, json.dumps(operation_data))
-        self.redis.ltrim(history_key, 0, 999)  # Keep only 1000 most recent operations
+        from config.settings import REDIS_KEYS
+        history_key = REDIS_KEYS['SCALING_HISTORY']
+        self.redis_client.lpush(history_key, json.dumps(operation_data))
+        self.redis_client.ltrim(history_key, 0, 999)  # Keep only 1000 most recent operations
 
     def _get_operation_history(self, limit: int = 100) -> list:
         """Get operation history from Redis"""
+        from config.settings import REDIS_KEYS
         history = []
-        for record in self.redis.lrange("async_scaling:operation_history", 0, limit - 1):
+        for record in self.redis_client.lrange(REDIS_KEYS['SCALING_HISTORY'], 0, limit - 1):
             history.append(json.loads(record.decode()))
         return history
 
