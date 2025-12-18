@@ -8,7 +8,6 @@ import concurrent.futures
 import json
 import logging
 import time
-import os
 import docker
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timezone
@@ -242,32 +241,32 @@ class AsyncScalingManager:
                     error_messages.append(error)
 
         # Wait for Kubernetes nodes to be removed
-        logger.info(f"DEBUG: Scale-down check - successful_removals={len(successful_removals)}, has_k8s_api={hasattr(self, 'k8s_api')}")
+        logger.debug(f"Scale-down check - successful_removals={len(successful_removals)}, has_k8s_api={hasattr(self, 'k8s_api')}")
 
         if successful_removals and hasattr(self, 'k8s_api'):
-            logger.info(f"DEBUG: Waiting for Kubernetes node removal for {len(successful_removals)} workers")
+            logger.debug(f" Waiting for Kubernetes node removal for {len(successful_removals)} workers")
             wait_tasks = []
             for worker in successful_removals:
-                logger.info(f"DEBUG: Creating wait task for {worker.node_name}")
+                logger.debug(f" Creating wait task for {worker.node_name}")
                 task = self._wait_for_kubernetes_removal_async(worker)
                 wait_tasks.append(task)
 
             wait_results = await asyncio.gather(*wait_tasks, return_exceptions=True)
-            logger.info(f"DEBUG: Wait results returned for {len(wait_results)} workers")
+            logger.debug(f" Wait results returned for {len(wait_results)} workers")
 
             # Update database with verified removals
             db_updates = []
             for worker, verified in zip(successful_removals, wait_results):
-                logger.info(f"DEBUG: Worker {worker.node_name} verified: {verified}")
+                logger.debug(f" Worker {worker.node_name} verified: {verified}")
                 if isinstance(verified, dict) and verified.get('removed', False):
                     db_updates.append(worker)
 
             # Update database concurrently
             if db_updates:
-                logger.info(f"DEBUG: Calling database.remove_worker for {len(db_updates)} workers")
+                logger.debug(f" Calling database.remove_worker for {len(db_updates)} workers")
                 db_tasks = []
                 for worker in db_updates:
-                    logger.info(f"DEBUG: Scheduling DB removal for {worker.node_name}")
+                    logger.debug(f" Scheduling DB removal for {worker.node_name}")
                     task = asyncio.get_event_loop().run_in_executor(
                         self.thread_pool,
                         database.remove_worker,
@@ -276,19 +275,19 @@ class AsyncScalingManager:
                     db_tasks.append(task)
 
                 db_results = await asyncio.gather(*db_tasks, return_exceptions=True)
-                logger.info(f"DEBUG: DB removal results: {len(db_results)}")
+                logger.debug(f" DB removal results: {len(db_results)}")
 
                 # Log any database errors
                 for worker, result in zip(db_updates, db_results):
                     if isinstance(result, Exception):
                         error_messages.append(f"DB removal error for {worker.node_name}: {str(result)}")
             else:
-                logger.info("DEBUG: No workers verified as removed for database updates")
+                logger.debug(" No workers verified as removed for database updates")
         else:
             if not successful_removals:
-                logger.info("DEBUG: No successful removals to wait for")
+                logger.debug(" No successful removals to wait for")
             if not hasattr(self, 'k8s_api'):
-                logger.warning("DEBUG: Kubernetes API not available, skipping node removal wait")
+                logger.debug("Kubernetes API not available, skipping node removal wait")
 
         elapsed = time.time() - start_time
         logger.info(f"Concurrent scale-down completed in {elapsed:.2f}s: "
@@ -384,8 +383,6 @@ class AsyncScalingManager:
     def _create_worker_node_sync(self, worker_id: int, docker_client) -> Optional[WorkerNode]:
         """Synchronous worker creation (runs in thread pool)"""
         try:
-            from config.settings import settings, REDIS_KEYS
-            
             # CRITICAL FIX: Atomically increment FIRST to reserve the number
             # This prevents race conditions in concurrent scaling
             if not self.redis_client.exists(self.worker_counter_key):
@@ -454,7 +451,6 @@ class AsyncScalingManager:
     def _remove_worker_container_sync(self, worker: WorkerNode, docker_client) -> bool:
         """Synchronous container removal (runs in thread pool)"""
         try:
-            from config.settings import REDIS_KEYS
             # Check if worker is permanent before removal
             permanent_workers = self.redis_client.set_members(REDIS_KEYS['WORKERS_PERMANENT'])
             if worker.node_name in permanent_workers:
@@ -494,7 +490,7 @@ class AsyncScalingManager:
         except Exception as e:
             logger.error(f"Failed to remove container {worker.node_name}: {e}")
             return False
-
+ 
     def _mark_node_unschedulable_sync(self, node_name: str) -> None:
         """Synchronous node marking (runs in thread pool)"""
         if not hasattr(self, 'k8s_api') or not self.k8s_api:
@@ -530,14 +526,12 @@ class AsyncScalingManager:
 
     def _add_operation_history(self, operation_data: dict):
         """Add operation to history in Redis"""
-        from config.settings import REDIS_KEYS
         history_key = REDIS_KEYS['SCALING_HISTORY']
         self.redis_client.lpush(history_key, json.dumps(operation_data))
         self.redis_client.ltrim(history_key, 0, 999)  # Keep only 1000 most recent operations
 
     def _get_operation_history(self, limit: int = 100) -> list:
         """Get operation history from Redis"""
-        from config.settings import REDIS_KEYS
         history = []
         for record in self.redis_client.lrange(REDIS_KEYS['SCALING_HISTORY'], 0, limit - 1):
             history.append(json.loads(record.decode()))
