@@ -219,9 +219,14 @@ class StateReconciler:
             try:
                 nodes = self.k8s_api.list_node()
                 for node in nodes.items:
-                    # Skip control plane
-                    if node.metadata.labels and \
-                       'node-role.kubernetes.io/control-plane' in node.metadata.labels:
+                    # Skip control plane and master nodes
+                    if node.metadata.labels:
+                        if 'node-role.kubernetes.io/control-plane' in node.metadata.labels:
+                            continue
+                        if 'node-role.kubernetes.io/master' in node.metadata.labels:
+                            continue
+                    # Fallback: skip nodes with master in name
+                    if 'master' in node.metadata.name.lower():
                         continue
                     state["k8s"].add(node.metadata.name)
             except Exception as e:

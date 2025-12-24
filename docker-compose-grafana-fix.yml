@@ -1,0 +1,8 @@
+# Temporary override to fix Grafana bind mount issues
+# This removes the problematic dashboard file bind mounts
+services:
+  grafana:
+    volumes:
+      - grafana-data:/var/lib/grafana
+      # All bind mounts temporarily removed due to Docker Desktop WSL2 issue
+      # - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro

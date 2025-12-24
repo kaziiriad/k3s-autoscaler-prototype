@@ -25,21 +25,6 @@ from core.reconciliation import ReconciliationService
 from database import DatabaseManager
 from api.server import APIServer
 from config import Settings, settings
-# Import event metrics to register them with Prometheus
-from events.event_metrics import (
-    EVENT_BUS_PUBLISHED_TOTAL,
-    EVENT_BUS_PROCESSED_TOTAL,
-    EVENT_BUS_QUEUE_SIZE,
-    EVENT_BUS_SUBSCRIBERS,
-    EVENT_BUS_HANDLER_DURATION,
-    EVENT_BUS_ERRORS_TOTAL,
-    EVENT_BUS_HEALTH,
-    EVENT_BUS_EVENTS_RATE,
-    OPTIMAL_STATE_EVENTS,
-    SCALING_EVENTS,
-    CLUSTER_STATE_EVENTS,
-    RESOURCE_PRESSURE_EVENTS
-)
 
 # Prometheus metrics
 SCALING_DECISIONS = Counter('autoscaler_scaling_decisions_total', 'Total scaling decisions', ['decision'])
@@ -173,16 +158,13 @@ class AutoscalerService:
             self.reconciliation_service = ReconciliationService(self.autoscaler)
             await self.reconciliation_service.start()
 
-            # Initialize event system
-            await self.autoscaler.initialize_events()
-
         # Run background services
         background_thread = threading.Thread(
             target=lambda: asyncio.run(start_background_services())
         )
         background_thread.daemon = True
         background_thread.start()
-        self.logger.info("Background services started (reconciliation + events)")
+        self.logger.info("Background services started (reconciliation)")
 
         # Main autoscaling loop
         interval = self.config['autoscaler']['check_interval']
@@ -233,20 +215,6 @@ class AutoscalerService:
     def cleanup(self):
         """Cleanup resources"""
         try:
-            # Shutdown event system gracefully
-            if self.autoscaler and hasattr(self.autoscaler, 'shutdown_events'):
-                import asyncio
-                try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        # Create task for shutdown
-                        asyncio.create_task(self.autoscaler.shutdown_events())
-                    else:
-                        # Run shutdown synchronously
-                        loop.run_until_complete(self.autoscaler.shutdown_events())
-                except Exception as e:
-                    self.logger.error(f"Error shutting down event system: {e}")
-
             if self.autoscaler:
                 self.autoscaler.cleanup()
             if self.database:

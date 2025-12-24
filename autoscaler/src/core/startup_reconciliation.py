@@ -110,13 +110,17 @@ class StartupReconciler:
         return results
     
     def _gather_state(self) -> Dict:
-        """Gather current state from all sources"""
+        """Gather current state from all sources
+
+        Redis is the source of truth for worker state.
+        MongoDB is only for historical events (scaling history).
+        """
         state = {
             "docker_containers": {},
-            "database_workers": {},
+            "redis_workers": {},
             "k8s_nodes": set()
         }
-        
+
         # Get Docker containers
         try:
             containers = self.docker_client.containers.list(all=True)
@@ -130,19 +134,20 @@ class StartupReconciler:
             logger.info(f"Found {len(state['docker_containers'])} Docker containers")
         except Exception as e:
             logger.error(f"Failed to get Docker containers: {e}")
-        
-        # Get database workers
+
+        # Get Redis workers (source of truth for worker state)
         try:
-            workers = self.database.get_all_workers()
-            for worker in workers:
-                state["database_workers"][worker.node_name] = {
-                    "status": worker.status.value,
-                    "container_id": worker.container_id,
-                    "launched_at": worker.launched_at
+            # Use Redis cache to get all workers
+            workers_dict = self.database.get_all_workers_dict()
+            for worker_name, worker_data in workers_dict.items():
+                state["redis_workers"][worker_name] = {
+                    "status": worker_data.get("status"),
+                    "container_id": worker_data.get("container_id"),
+                    "node_name": worker_name
                 }
-            logger.info(f"Found {len(state['database_workers'])} database workers")
+            logger.info(f"Found {len(state['redis_workers'])} Redis workers")
         except Exception as e:
-            logger.error(f"Failed to get database workers: {e}")
+            logger.warning(f"Could not get Redis workers: {e}")
         
         # Get Kubernetes nodes
         if hasattr(self.autoscaler.metrics, 'k8s_api') and self.autoscaler.metrics.k8s_api:
@@ -181,8 +186,8 @@ class StartupReconciler:
         permanent.add(f"{self.worker_prefix}-1")
         permanent.add(f"{self.worker_prefix}-2")
         
-        # Check metadata in database for workers created by docker-compose
-        for worker_name, details in state["database_workers"].items():
+        # Check metadata in Redis for workers created by docker-compose
+        for worker_name, details in state["redis_workers"].items():
             # Check if this was created by docker-compose (in metadata)
             # This would require storing metadata, which we should do
             pass
@@ -194,53 +199,56 @@ class StartupReconciler:
         return existing_permanent
     
     def _clean_stale_entries(self, state: Dict, permanent_workers: set) -> list:
-        """Clean stale database entries that don't have corresponding Docker containers"""
+        """Clean stale Redis entries that don't have corresponding Docker containers"""
         actions = []
-        
+
         docker_names = set(state["docker_containers"].keys())
-        db_names = set(state["database_workers"].keys())
-        
-        # Find workers in DB but not in Docker (excluding permanent workers)
-        stale_workers = db_names - docker_names - permanent_workers
-        
+        redis_names = set(state["redis_workers"].keys())
+
+        # Find workers in Redis but not in Docker (excluding permanent workers)
+        stale_workers = redis_names - docker_names - permanent_workers
+
         if stale_workers:
-            logger.warning(f"Found {len(stale_workers)} stale database entries")
-            
+            logger.warning(f"Found {len(stale_workers)} stale Redis entries")
+
             for worker_name in stale_workers:
                 try:
-                    logger.info(f"Removing stale database entry: {worker_name}")
-                    if self.database.workers.delete(worker_name):
-                        actions.append(f"Removed stale DB entry: {worker_name}")
-                        logger.info(f"✓ Removed: {worker_name}")
+                    logger.info(f"Removing stale Redis entry: {worker_name}")
+                    if self.database.remove_worker(worker_name):
+                        actions.append(f"Removed stale Redis entry: {worker_name}")
+                        logger.info(f"✓ Removed from Redis: {worker_name}")
                 except Exception as e:
                     logger.error(f"Failed to remove {worker_name}: {e}")
         else:
-            logger.info("No stale database entries found")
-        
+            logger.info("No stale Redis entries found")
+
         return actions
     
     def _sync_docker_to_database(self, state: Dict, permanent_workers: set) -> list:
-        """Sync Docker containers to database"""
+        """Sync Docker containers to Redis (source of truth for worker state)
+
+        Note: MongoDB is only for historical events (scaling history), not worker state.
+        """
         actions = []
-        
+
         docker_names = set(state["docker_containers"].keys())
-        db_names = set(state["database_workers"].keys())
-        
-        # Find workers in Docker but not in DB
-        missing_in_db = docker_names - db_names
-        
-        if missing_in_db:
-            logger.warning(f"Found {len(missing_in_db)} Docker containers not in database")
-            
-            from database import WorkerNode, NodeStatus
-            
-            for worker_name in missing_in_db:
+        redis_names = set(state["redis_workers"].keys())
+
+        # Find workers in Docker but not in Redis
+        missing_in_redis = docker_names - redis_names
+
+        if missing_in_redis:
+            logger.warning(f"Found {len(missing_in_redis)} Docker containers not in Redis")
+
+            for worker_name in missing_in_redis:
                 try:
                     docker_details = state["docker_containers"][worker_name]
-                    
+
                     # Determine if this is a permanent worker
                     is_permanent = worker_name in permanent_workers
-                    
+
+                    # Add to Redis cache
+                    from database import WorkerNode, NodeStatus
                     worker = WorkerNode(
                         node_name=worker_name,
                         container_id=docker_details["id"],
@@ -248,24 +256,42 @@ class StartupReconciler:
                         status=NodeStatus.READY if docker_details["running"] else NodeStatus.STOPPED,
                         launched_at=datetime.now(timezone.utc),
                         metadata={
-                            "created_by": "docker_compose" if is_permanent else "unknown",
+                            "created_by": "docker_compose" if is_permanent else "startup_reconciliation",
                             "synced_at": datetime.now(timezone.utc).isoformat(),
                             "is_permanent": is_permanent
                         }
                     )
-                    
-                    if self.database.add_worker(worker):
-                        actions.append(f"Added missing DB entry: {worker_name}")
-                        logger.info(f"✓ Added to database: {worker_name}")
+
+                    # Add to Redis (state store)
+                    self.database.add_worker_to_cache(worker)
+
+                    # Record in MongoDB as historical event only
+                    self.database.store_scaling_event(
+                        event_type="worker_discovered",
+                        count=1,
+                        reason=f"Worker {worker_name} discovered during startup reconciliation",
+                        metadata={
+                            "worker_name": worker_name,
+                            "container_id": docker_details["id"],
+                            "is_permanent": is_permanent,
+                            "discovered_by": "startup_reconciliation"
+                        }
+                    )
+
+                    actions.append(f"Added to Redis: {worker_name}")
+                    logger.info(f"✓ Added to Redis: {worker_name}")
                 except Exception as e:
-                    logger.error(f"Failed to add {worker_name} to database: {e}")
+                    logger.error(f"Failed to add {worker_name} to Redis: {e}")
         else:
-            logger.info("All Docker containers are tracked in database")
-        
+            logger.info("All Docker containers are tracked in Redis")
+
         return actions
     
     def _fix_worker_counter(self, state: Dict) -> Optional[str]:
-        """Fix the worker counter in Redis - ensure it NEVER decreases"""
+        """Fix the worker counter in Redis - ensure it NEVER decreases
+
+        Only considers Docker containers and Redis (source of truth).
+        """
         try:
             # Get highest worker number from Docker
             max_num = 0
@@ -275,21 +301,21 @@ class StartupReconciler:
                     max_num = max(max_num, num)
                 except (ValueError, IndexError):
                     pass
-            
-            # Also check database for potentially higher numbers
-            for worker_name in state["database_workers"].keys():
+
+            # Also check Redis for potentially higher numbers
+            for worker_name in state["redis_workers"].keys():
                 try:
                     num = int(worker_name.split('-')[-1])
                     max_num = max(max_num, num)
                 except (ValueError, IndexError):
                     pass
-            
+
             # Counter should be at least max_num + 1
             correct_counter = max_num + 1
-            
+
             # Get current counter from Redis
             current_counter = int(self.database.redis.get("workers:next_number") or 0)
-            
+
             # CRITICAL: Counter should NEVER decrease
             if current_counter < correct_counter:
                 logger.warning(
@@ -308,7 +334,7 @@ class StartupReconciler:
             else:
                 logger.info(f"Worker counter is correct: {current_counter}")
                 return None
-                
+
         except Exception as e:
             logger.error(f"Failed to fix worker counter: {e}")
             return None

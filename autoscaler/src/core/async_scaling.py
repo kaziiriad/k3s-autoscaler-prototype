@@ -301,6 +301,7 @@ class AsyncScalingManager:
             return {"ready": True, "message": "Kubernetes API not available, assuming success"}
 
         start_time = time.time()
+        last_error = None
 
         while (time.time() - start_time) < timeout:
             try:
@@ -315,16 +316,35 @@ class AsyncScalingManager:
                 # Check if node is ready
                 if node.status.conditions:
                     for condition in node.status.conditions:
-                        if condition.type == "Ready" and condition.status == "True":
-                            return {"ready": True, "message": "Node is ready"}
+                        if condition.type == "Ready":
+                            if condition.status == "True":
+                                logger.info(f"Node {worker.node_name} is ready")
+                                return {"ready": True, "message": "Node is ready"}
+                            else:
+                                last_error = f"Node Ready condition is {condition.status}: {condition.message or 'No message'}"
 
                 await asyncio.sleep(5)  # Non-blocking sleep
 
             except Exception as e:
-                logger.debug(f"Node {worker.node_name} not ready yet: {e}")
+                last_error = str(e)
+                if "404" in last_error or "Not Found" in last_error:
+                    logger.warning(f"Node {worker.node_name} not found in Kubernetes API")
+                    last_error = "Node not registered in Kubernetes"
+                else:
+                    logger.debug(f"Node {worker.node_name} not ready yet: {e}")
                 await asyncio.sleep(5)
 
-        return {"ready": False, "message": f"Timeout waiting for node {worker.node_name}"}
+        # Get container logs for debugging
+        try:
+            import docker
+            docker_client = docker.from_env()
+            container = docker_client.containers.get(worker.container_name)
+            container_logs = container.logs(tail=50).decode('utf-8')
+            logger.error(f"Container logs for {worker.node_name}:\n{container_logs}")
+        except Exception as log_error:
+            logger.error(f"Could not get container logs: {log_error}")
+
+        return {"ready": False, "message": f"Timeout waiting for node {worker.node_name}. Last error: {last_error}"}
 
     async def _drain_node_async(self, worker: WorkerNode) -> bool:
         """Asynchronously drain a Kubernetes node"""
@@ -396,11 +416,17 @@ class AsyncScalingManager:
 
             # Create the container
             try:
+                # Pre-create the volume directory
+                import os
+                volume_path = f'/tmp/k3s-{node_name}'
+                os.makedirs(volume_path, exist_ok=True)
+
                 container = docker_client.containers.run(
                     image=settings.docker.image,
                     name=node_name,
                     detach=True,
                     privileged=True,
+                    hostname=node_name,
                     environment={
                         'K3S_URL': f"https://{settings.kubernetes.server_host or 'k3s-master'}:6443",
                         'K3S_TOKEN': settings.autoscaler.k3s_token,
@@ -408,11 +434,18 @@ class AsyncScalingManager:
                         'K3S_WITH_NODE_ID': 'true'
                     },
                     volumes={
-                        f'/tmp/k3s-{node_name}': {'bind': '/var/lib/rancher/k3s', 'mode': 'rw'},
+                        volume_path: {'bind': '/var/lib/rancher/k3s', 'mode': 'rw'},
                     },
                     network=settings.docker.network,
                     restart_policy={'Name': 'always'},
-                    labels={'com.docker.compose.project': 'prototype'}
+                    labels={'com.docker.compose.project': 'prototype'},
+                    command='agent',
+                    healthcheck={
+                        'test': ['CMD', 'pgrep', '-f', 'k3s'],
+                        'interval': 10000000000,  # 10 seconds in nanoseconds
+                        'timeout': 5000000000,    # 5 seconds
+                        'retries': 3
+                    }
                 )
                 
                 logger.info(f"Successfully created worker {node_name} with reserved number {worker_num}")

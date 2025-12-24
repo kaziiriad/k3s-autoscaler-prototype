@@ -18,15 +18,6 @@ from .scaling import ScalingEngine
 from .async_scaling import AsyncScalingManager
 from core.logging_config import log_separator, log_section
 import concurrent.futures
-from events import (
-    Event,
-    ScalingActionCompleted,
-    ClusterStateSynced,
-    OptimalStateTrigger,
-    UnderutilizationWarning,
-    ResourcePressureAlert,
-    PendingPodsDetected
-)
 
 logger = logging.getLogger(__name__)
 
@@ -59,20 +50,11 @@ class K3sAutoscaler:
         # Initialize default state
         self.worker_prefix = settings.autoscaler.worker_prefix
 
-        # Initialize event system (will be properly initialized in async context)
-        self.event_bus_integration = None
-        self.event_emitter = None
-        self.health_monitor = None
-        self._events_initialized = False
-
-        # Track optimal state emissions (backup for Redis)
-        self._last_optimal_state_emission = None
-
         # Initialize last scaling timestamps to prevent datetime comparison errors
         self.last_scale_up = None
         self.last_scale_down = None
 
-        logger.info("K3s Autoscaler initialized with database support, async operations, and event-driven architecture")
+        logger.info("K3s Autoscaler initialized with database support and async operations")
 
         # Perform startup reconciliation to ensure data integrity
         logger.info("Performing startup reconciliation...")
@@ -133,34 +115,14 @@ class K3sAutoscaler:
             # Update Prometheus metrics if configured
             self._update_state(metrics_data, decision_result)
 
-            # Check for optimal state and emit event if applicable
+            # Check for optimal state and log it
             if (not decision_result.get('should_scale', False) and
                 metrics_data.current_nodes == self.config['autoscaler']['limits']['min_nodes'] and
                 metrics_data.avg_cpu < 50 and metrics_data.avg_memory < 80 and
                 metrics_data.pending_pods == 0):
 
-                # Check cooldown for OptimalStateTrigger (emit every 5 minutes max)
-                current_time = datetime.now(timezone.utc)
-                emit_cooldown = 300  # 5 minutes
-
-                if (self._last_optimal_state_emission is None or
-                    (current_time - self._last_optimal_state_emission).total_seconds() >= emit_cooldown):
-
-                    # Emit optimal state trigger
-                    self._emit_event_sync(OptimalStateTrigger(
-                        source="K3sAutoscaler",
-                        data={
-                            "current_workers": metrics_data.current_nodes,
-                            "min_workers": self.config['autoscaler']['limits']['min_nodes'],
-                            "cpu_avg": metrics_data.avg_cpu,
-                            "memory_avg": metrics_data.avg_memory,
-                            "pending_pods": metrics_data.pending_pods
-                        }
-                    ))
-
-                    # Update last emission time
-                    self._last_optimal_state_emission = current_time
-                    logger.debug(f"OptimalStateTrigger emitted (next allowed in {emit_cooldown}s)")
+                logger.info(f"✓ Cluster at optimal state: {metrics_data.current_nodes} workers, "
+                          f"CPU: {metrics_data.avg_cpu:.1f}%, Memory: {metrics_data.avg_memory:.1f}%")
 
             return {
                 "metrics": metrics_data,
@@ -329,20 +291,9 @@ class K3sAutoscaler:
 
             logger.info(f"Successfully scaled up by {len(successful_workers)} nodes in async mode")
 
-            # Emit scaling completed event
-            previous_workers = self.database.get_worker_count() - len(successful_workers)
-            new_workers = self.database.get_worker_count()
-            self._emit_event_sync(ScalingActionCompleted(
-                source="K3sAutoscaler",
-                data={
-                    "action": "scale_up",
-                    "count": len(successful_workers),
-                    "previous_workers": previous_workers,
-                    "new_workers": new_workers,
-                    "reason": decision.get("reason", "Resource pressure or pending pods"),
-                    "successful_workers": [w.node_name for w in successful_workers]
-                }
-            ))
+            # Log scaling action details (instead of events)
+            logger.info(f"Scale up details: +{len(successful_workers)} workers, "
+                      f"Reason: {decision.get('reason', 'Resource pressure or pending pods')}")
 
             return True
 
@@ -633,20 +584,9 @@ class K3sAutoscaler:
 
                 logger.info(f"Successfully scaled down by {len(successful_removals)} nodes in async mode")
 
-                # Emit scaling completed event
-                previous_workers = self.database.get_worker_count() + len(successful_removals)
-                new_workers = self.database.get_worker_count()
-                self._emit_event_sync(ScalingActionCompleted(
-                    source="K3sAutoscaler",
-                    data={
-                        "action": "scale_down",
-                        "count": len(successful_removals),
-                        "previous_workers": previous_workers,
-                        "new_workers": new_workers,
-                        "reason": decision.get("reason", "Underutilization"),
-                        "removed_workers": [w.node_name for w in successful_removals]
-                    }
-                ))
+                # Log scaling action details (instead of events)
+                logger.info(f"Scale down details: -{len(successful_removals)} workers, "
+                          f"Reason: {decision.get('reason', 'Underutilization')}")
 
                 return True
             else:
@@ -1152,17 +1092,6 @@ class K3sAutoscaler:
 
             logger.info("Database sync with cluster completed")
 
-            # Emit cluster state synced event
-            self._emit_event_sync(ClusterStateSynced(
-                source="K3sAutoscaler",
-                data={
-                    "k8s_nodes": len(actual_containers),
-                    "docker_containers": len(actual_containers),
-                    "db_workers": len(db_workers),
-                    "sync_time": datetime.now(timezone.utc).isoformat()
-                }
-            ))
-
         except Exception as e:
             logger.error(f"Failed to sync database with cluster: {e}")
             # Don't fail initialization, just log the error
@@ -1199,66 +1128,4 @@ class K3sAutoscaler:
         except Exception as e:
             logger.error(f"Failed to initialize permanent workers in Redis: {e}")
 
-    async def initialize_events(self):
-        """Initialize event system - call this during startup"""
-        if self._events_initialized:
-            return True
-
-        logger.info("Initializing improved event system...")
-
-        try:
-            from events.improved_event_bus import (
-                ImprovedEventBusIntegration,
-                SafeEventEmitter,
-                EventBusHealthMonitor
-            )
-
-            # Create event bus integration
-            self.event_bus_integration = ImprovedEventBusIntegration(self)
-
-            # Initialize event bus
-            success = await self.event_bus_integration.initialize()
-            if not success:
-                logger.error("Event bus initialization failed, continuing without events")
-                return False
-
-            # Create event emitter for sync code
-            self.event_emitter = SafeEventEmitter(self.event_bus_integration)
-            await self.event_emitter.start_background_publisher()
-
-            # Start health monitoring
-            self.health_monitor = EventBusHealthMonitor(self.event_bus_integration)
-            asyncio.create_task(self.health_monitor.start())
-
-            self._events_initialized = True
-            logger.info("✓ Improved event system initialized")
-            return True
-
-        except Exception as e:
-            logger.error(f"Failed to initialize event system: {e}")
-            self._events_initialized = False
-            return False
-
-    def emit_event_safe(self, event):
-        """
-        Safely emit event from any context (sync or async)
-        USE THIS in your autoscaler code
-        """
-        if self.event_emitter:
-            self.event_emitter.emit_sync(event)
-        else:
-            # Fallback: just log
-            logger.info(f"EVENT (no emitter): {event.event_type.value}")
-
-    async def shutdown_events(self):
-        """Shutdown event system gracefully"""
-        if self.event_emitter:
-            await self.event_emitter.shutdown()
-
-        if self.event_bus_integration:
-            await self.event_bus_integration.shutdown()
-        self._events_initialized = False
-
-    def _emit_event_sync(self, event: Event):
-        """Legacy method - redirects to emit_event_safe"""
-        self.emit_event_safe(event)
+    

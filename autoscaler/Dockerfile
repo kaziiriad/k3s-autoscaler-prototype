@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
+
 # Install kubectl for debugging
 RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
     && chmod +x kubectl \
@@ -25,6 +26,7 @@ RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/s
 
 # Create non-root user (for security when not using Docker socket)
 RUN groupadd -r autoscaler && useradd -r -g autoscaler autoscaler
+
 
 # Install Python dependencies
 # Consolidate all requirements into one file
