@@ -5,13 +5,13 @@ A production-grade autoscaler that dynamically adds/removes Docker containers ru
 ## Architecture
 
 ### Core Components
-- **k3s Master**: Runs the Kubernetes control plane
+- **k3s Master**: Runs the Kubernetes control plane (excluded from scaling)
 - **k3s Workers**: Docker containers that join the cluster as worker nodes
 - **Prometheus**: Collects metrics from node-exporter and kube-state-metrics
 - **Autoscaler**: Python service that makes scaling decisions with atomic operations
 - **Grafana**: Visualizes metrics and scaling events with pre-built dashboards
-- **MongoDB**: Persistent storage for scaling history and worker state
-- **Redis**: Real-time caching and cooldown management
+- **MongoDB**: Persistent storage for scaling history (events only, not worker state)
+- **Redis**: Source of truth for worker state, cooldown management, and caching
 
 ### Key Features
 - ✅ **Atomic Scaling Operations**: Ensures consistency across Docker, Kubernetes, and database
@@ -306,6 +306,21 @@ Dry-run mode: Skipping actual scaling execution
 | MongoDB | 27017 | Database |
 | Redis | 6379 | Cache |
 
+## Recent Fixes and Improvements
+
+### Critical Issues Resolved
+- ✅ **Worker Verification Timeout**: Fixed by adding missing `command: agent` to worker containers
+- ✅ **Control-Plane Node Protection**: Reconciliation now properly filters out k3s-master from worker operations
+- ✅ **Redis as Source of Truth**: Startup reconciliation now uses Redis instead of MongoDB for worker state
+- ✅ **Enhanced Container Health Checks**: Added health checks and hostname to worker containers
+- ✅ **Better Error Reporting**: Container logs now included in verification failure messages
+
+### Architecture Improvements
+- **State Management Separation**: Redis maintains worker state, MongoDB stores historical events only
+- **LIFO Scaling with Permanent Workers**: k3s-worker-1 and k3s-worker-2 are permanent and protected from scaling
+- **Control-Plane Detection**: Automatic filtering of master nodes using multiple label checks
+- **Improved Reconciliation**: Startup sync now properly respects state hierarchy (Docker → Redis → MongoDB)
+
 ## Troubleshooting
 
 ### Common Issues
@@ -388,7 +403,21 @@ Dry-run mode: Skipping actual scaling execution
    curl -s http://localhost:9091/metrics | grep reconciliation
    ```
 
-8. **Event bus issues**
+8. **Grafana fails to start with bind mount error**
+   ```bash
+   # This is a known Docker Desktop + WSL2 issue
+   # Option 1: Restart Docker Desktop from Windows
+   # Right-click Docker Desktop tray icon → Quit → Restart
+
+   # Option 2: Use the workaround compose file
+   docker-compose -f docker-compose-with-db.yml \
+     -f docker-compose-grafana-fix.yml up -d grafana
+
+   # Option 3: Skip Grafana temporarily
+   # Prometheus is still available at http://localhost:9090
+   ```
+
+9. **Event bus issues**
    ```bash
    # Check autoscaler logs for event bus errors
    docker logs prototype-autoscaler-1 | grep -i "event bus"
