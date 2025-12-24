@@ -52,6 +52,35 @@ services:
       - k3s-master
     restart: "no"
 
+  # Monitoring deployer - automatically deploys Prometheus and monitoring stack in-cluster
+  monitoring-deployer:
+    image: rancher/k3s:v1.29.1-k3s1
+    container_name: monitoring-deployer
+    volumes:
+      - ./monitoring:/manifests:ro
+    command: >
+      sh -c "
+        echo 'Waiting for k3s-master to be ready...'
+        until kubectl --server=https://k3s-master:6443 get nodes >/dev/null 2>&1; do
+          echo 'Waiting for k3s-master...'
+          sleep 2
+        done
+        echo 'k3s-master is ready, deploying monitoring stack...'
+        kubectl --server=https://k3s-master:6443 apply -f /manifests/node-exporter-daemonset.yaml
+        kubectl --server=https://k3s-master:6443 apply -f /manifests/node-exporter-service.yaml
+        kubectl --server=https://k3s-master:6443 apply -f /manifests/kube-state-metrics.yaml
+        kubectl --server=https://k3s-master:6443 apply -f /manifests/prometheus-in-cluster/
+        echo 'Waiting for Prometheus pod to be ready...'
+        kubectl --server=https://k3s-master:6443 wait --for=condition=ready pod -l app=prometheus -n monitoring --timeout=120s
+        echo 'Monitoring stack deployed successfully!'
+      "
+    networks:
+      - k3s-network
+    depends_on:
+      k3s-master:
+        condition: service_healthy
+    restart: "no"
+
   # K3s Worker Nodes
   k3s-worker-1:
     image: rancher/k3s:v1.29.1-k3s1
@@ -211,6 +240,7 @@ services:
       - k3s-master
       - mongodb
       - redis
+      - monitoring-deployer
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/reconciliation/status"]
