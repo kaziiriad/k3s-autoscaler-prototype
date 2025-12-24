@@ -33,6 +33,8 @@ A production-grade autoscaler that dynamically adds/removes Docker containers ru
 ### 1. Start the complete stack
 ```bash
 # Start all services including monitoring and database
+# Monitoring stack (Prometheus, node-exporter, kube-state-metrics)
+# is automatically deployed in-cluster
 docker-compose -f docker-compose-with-db.yml up -d
 
 # Or use the quick start script
@@ -43,6 +45,9 @@ docker-compose -f docker-compose-with-db.yml up -d
 ```bash
 # Check k3s nodes (1 master + 2 workers)
 docker exec k3s-master kubectl get nodes
+
+# Check monitoring pods deployed in-cluster
+docker exec k3s-master kubectl get pods -n monitoring
 
 # Check all services
 docker-compose ps
@@ -55,7 +60,7 @@ docker-compose ps
 - **Grafana Dashboard**: http://localhost:3000 (admin/admin)
   - Pre-configured k3s cluster dashboard
   - Individual node metrics visualization
-- **Prometheus**: http://localhost:9090
+- **Prometheus** (in-cluster NodePort): http://localhost:30900
 - **Autoscaler API**: http://localhost:8080/health
 
 ### 4. Deploy test workloads (to trigger autoscaling)
@@ -234,7 +239,7 @@ For **Scale Down**:
 ### In-Cluster Monitoring Deployment
 The monitoring stack runs inside the Kubernetes cluster for better integration and reliability:
 
-**Deployment**: Run `./scripts/deploy-monitoring-in-cluster.sh` to deploy all monitoring components.
+**Automatic Deployment**: The monitoring stack is deployed automatically when you run `docker-compose up`. A `monitoring-deployer` service waits for the k3s cluster to be ready, then applies all monitoring manifests.
 
 **Components Deployed In-Cluster**:
 - **Prometheus**: Runs on the master node with persistent storage
@@ -243,6 +248,11 @@ The monitoring stack runs inside the Kubernetes cluster for better integration a
   - Storage: 2Gi persistent volume
 - **Node Exporter DaemonSet**: Collects host metrics from all nodes
 - **kube-state-metrics**: Provides Kubernetes object metrics
+
+**Manual Deployment** (if needed):
+```bash
+./scripts/deploy-monitoring-in-cluster.sh
+```
 
 **External Components** (run via Docker Compose):
 - **Grafana**: http://localhost:3000 - Visualization dashboard
