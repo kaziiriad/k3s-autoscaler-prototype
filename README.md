@@ -7,7 +7,7 @@ A production-grade autoscaler that dynamically adds/removes Docker containers ru
 ### Core Components
 - **k3s Master**: Runs the Kubernetes control plane (excluded from scaling)
 - **k3s Workers**: Docker containers that join the cluster as worker nodes
-- **Prometheus**: Collects metrics from node-exporter and kube-state-metrics
+- **Prometheus**: Runs in-cluster on the master node, collects metrics from node-exporter and kube-state-metrics
 - **Autoscaler**: Python service that makes scaling decisions with atomic operations
 - **Grafana**: Visualizes metrics and scaling events with pre-built dashboards
 - **MongoDB**: Persistent storage for scaling history (events only, not worker state)
@@ -231,10 +231,22 @@ For **Scale Down**:
 
 ## Monitoring Stack
 
-### Prometheus Metrics Collection
-The system automatically deploys:
+### In-Cluster Monitoring Deployment
+The monitoring stack runs inside the Kubernetes cluster for better integration and reliability:
+
+**Deployment**: Run `./scripts/deploy-monitoring-in-cluster.sh` to deploy all monitoring components.
+
+**Components Deployed In-Cluster**:
+- **Prometheus**: Runs on the master node with persistent storage
+  - Service: `prometheus.monitoring.svc.cluster.local:9090` (internal)
+  - NodePort: `k3s-master:30900` (external access from autoscaler)
+  - Storage: 2Gi persistent volume
 - **Node Exporter DaemonSet**: Collects host metrics from all nodes
 - **kube-state-metrics**: Provides Kubernetes object metrics
+
+**External Components** (run via Docker Compose):
+- **Grafana**: http://localhost:3000 - Visualization dashboard
+- **AlertManager**: http://localhost:9093 - Alert routing and management
 - **Custom Autoscaler Metrics**: Exposed on port 9091
 
 ### Grafana Dashboard
@@ -299,12 +311,14 @@ Dry-run mode: Skipping actual scaling execution
 | Service | Port | Description |
 |---------|------|-------------|
 | k3s API | 6443 | Kubernetes API server |
-| Prometheus | 9090 | Metrics collection |
+| Prometheus (internal) | 9090 | In-cluster metrics service |
+| Prometheus NodePort | 30900 | External access from autoscaler |
 | Grafana | 3000 | Visualization dashboard |
 | Autoscaler API | 8080 | REST API |
 | Autoscaler Metrics | 9091 | Prometheus metrics |
 | MongoDB | 27017 | Database |
 | Redis | 6379 | Cache |
+| AlertManager | 9093 | Alert management |
 
 ## Recent Fixes and Improvements
 
@@ -320,6 +334,7 @@ Dry-run mode: Skipping actual scaling execution
 - **LIFO Scaling with Permanent Workers**: k3s-worker-1 and k3s-worker-2 are permanent and protected from scaling
 - **Control-Plane Detection**: Automatic filtering of master nodes using multiple label checks
 - **Improved Reconciliation**: Startup sync now properly respects state hierarchy (Docker → Redis → MongoDB)
+- **In-Cluster Prometheus**: Prometheus now runs inside the cluster on the master node with NodePort access for the autoscaler
 
 ## Troubleshooting
 

@@ -118,29 +118,32 @@ services:
     restart: unless-stopped
 
   # Prometheus for metrics collection
-  prometheus:
-    image: prom/prometheus:v2.40.7
-    container_name: prometheus
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
-      - ./monitoring/scaling_rules.yml:/etc/prometheus/scaling_rules.yml
-      - ./kubeconfig:/etc/prometheus/kubeconfig-ro:ro
-      - prometheus-data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/etc/prometheus/console_libraries'
-      - '--web.console.templates=/etc/prometheus/consoles'
-      - '--storage.tsdb.retention.time=200h'
-      - '--web.enable-lifecycle'
-    networks:
-      - k3s-network
-    depends_on:
-      - k3s-master
-      - monitoring-setup
-    restart: unless-stopped
+  # NOTE: Prometheus now runs inside the cluster as a pod
+  # See monitoring/prometheus-in-cluster/ for Kubernetes manifests
+  # Run: ./scripts/deploy-prometheus-in-cluster.sh
+  # prometheus:
+  #   image: prom/prometheus:v2.40.7
+  #   container_name: prometheus
+  #   ports:
+  #     - "9090:9090"
+  #   volumes:
+  #     - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+  #     - ./monitoring/scaling_rules.yml:/etc/prometheus/scaling_rules.yml
+  #     - ./kubeconfig:/etc/prometheus/kubeconfig-ro:ro
+  #     - prometheus-data:/prometheus
+  #   command:
+  #     - '--config.file=/etc/prometheus/prometheus.yml'
+  #     - '--storage.tsdb.path=/prometheus'
+  #     - '--web.console.libraries=/etc/prometheus/console_libraries'
+  #     - '--web.console.templates=/etc/prometheus/consoles'
+  #     - '--storage.tsdb.retention.time=200h'
+  #     - '--web.enable-lifecycle'
+  #   networks:
+  #     - k3s-network
+  #   depends_on:
+  #     - k3s-master
+  #     - monitoring-setup
+  #   restart: unless-stopped
 
   # AlertManager for alerting
   alertmanager:
@@ -171,8 +174,8 @@ services:
       - GF_USERS_ALLOW_SIGN_UP=false
     networks:
       - k3s-network
-    depends_on:
-      - prometheus
+    # depends_on:
+    #   - prometheus  # Prometheus is now in-cluster
     restart: unless-stopped
 
   # Autoscaler Service
@@ -215,82 +218,49 @@ services:
       timeout: 10s
       retries: 3
 
-  # Node Exporter for the host
-  node-exporter:
-    image: prom/node-exporter:latest
-    container_name: node-exporter
-    ports:
-      - "9100:9100"
-    volumes:
-      - /proc:/host/proc:ro
-      - /sys:/host/sys:ro
-      - /:/rootfs:ro
-    command:
-      - '--path.procfs=/host/proc'
-      - '--path.rootfs=/rootfs'
-      - '--path.sysfs=/host/sys'
-      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
-    networks:
-      - k3s-network
-    restart: unless-stopped
+  # Node Exporter for the host (DEPRECATED - now runs in-cluster as DaemonSet)
+  # Run: docker exec k3s-master kubectl apply -f monitoring/node-exporter-daemonset.yaml
+  # node-exporter:
+  #   image: prom/node-exporter:latest
+  #   container_name: node-exporter
+  #   ports:
+  #     - "9100:9100"
+  #   volumes:
+  #     - /proc:/host/proc:ro
+  #     - /sys:/host/sys:ro
+  #     - /:/rootfs:ro
+  #   command:
+  #     - '--path.procfs=/host/proc'
+  #     - '--path.rootfs=/rootfs'
+  #     - '--path.sysfs=/host/sys'
+  #     - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+  #   networks:
+  #     - k3s-network
+  #   restart: unless-stopped
 
-  # Kube-state-metrics
-  kube-state-metrics:
-    image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.10.0
-    container_name: kube-state-metrics
-    volumes:
-      - ./kubeconfig:/kubeconfig:ro
-    command:
-      - --kubeconfig=/kubeconfig/kubeconfig
-      - --port=8081
-      - --telemetry-port=8082
-    ports:
-      - "8081:8081"
-      - "8082:8082"
-    networks:
-      - k3s-network
-    depends_on:
-      - k3s-master
-    restart: unless-stopped
+  # Kube-state-metrics (DEPRECATED - now runs in-cluster)
+  # Run: docker exec k3s-master kubectl apply -f monitoring/kube-state-metrics.yaml
+  # kube-state-metrics:
+  #   image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.10.0
+  #   container_name: kube-state-metrics
+  #   volumes:
+  #     - ./kubeconfig:/kubeconfig:ro
+  #   command:
+  #     - --kubeconfig=/kubeconfig/kubeconfig
+  #     - --port=8081
+  #     - --telemetry-port=8082
+  #   ports:
+  #     - "8081:8081"
+  #     - "8082:8082"
+  #   networks:
+  #     - k3s-network
+  #     depends_on:
+  #       - k3s-master
+  #   restart: unless-stopped
 
-  # Monitoring Setup Service - Auto-configures node-exporter DaemonSet
-  monitoring-setup:
-    image: alpine:latest
-    container_name: monitoring-setup
-    volumes:
-      - ./kubeconfig:/workspace/kubeconfig
-      - ./setup_monitoring.sh:/workspace/setup_monitoring.sh:ro
-      - ./monitoring:/workspace/monitoring:ro
-    environment:
-      - KUBECONFIG=/workspace/kubeconfig/kubeconfig
-    working_dir: /workspace
-    command:
-      - /bin/sh
-      - -c
-      - |
-        apk add --no-cache curl &&
-        curl -LO https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl &&
-        install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl &&
-
-        echo "Deploying node-exporter DaemonSet..." &&
-        kubectl apply -f ./monitoring/node-exporter-daemonset.yaml --kubeconfig=./kubeconfig/kubeconfig &&
-
-        echo "Deploying node-exporter Service..." &&
-        kubectl apply -f ./monitoring/node-exporter-service.yaml --kubeconfig=./kubeconfig/kubeconfig &&
-
-        echo "Verifying deployments..." &&
-        sleep 5 &&
-
-        NODE_EXPORTER_PODS=$(kubectl get pods -l app=node-exporter -n kube-system --kubeconfig=./kubeconfig/kubeconfig --no-headers | wc -l) &&
-        echo "Node-exporter pods: $NODE_EXPORTER_PODS" &&
-
-        echo "Monitoring setup completed successfully!"
-    networks:
-      - k3s-network
-    depends_on:
-      kubeconfig-fixer:
-        condition: service_completed_successfully
-    restart: "no"
+  # Monitoring Setup Service (DEPRECATED - use deploy-monitoring-in-cluster.sh instead)
+  # Now monitoring components run inside the cluster
+  # Run: ./scripts/deploy-monitoring-in-cluster.sh
 
 volumes:
   k3s-master-data:
@@ -298,7 +268,7 @@ volumes:
   k3s-worker-2-data:
   mongodb-data:
   redis-data:
-  prometheus-data:
+  # prometheus-data:  # No longer needed - Prometheus uses PVC in-cluster
   grafana-data:
   alertmanager-data:
 

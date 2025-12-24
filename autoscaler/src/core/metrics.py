@@ -11,6 +11,7 @@ from database import DatabaseManager
 from models.metrics import NodeMetrics, ClusterMetrics, ClusterCapacity
 from core.logging_config import get_logger
 from kubernetes.client import ApiClient
+from config.settings import settings
 
 logger = get_logger(__name__)
 
@@ -28,7 +29,8 @@ class MetricsCollector:
         """
         self.config = config
         self.database = database
-        self.prometheus_url = "http://prometheus:9090"
+        # Use Prometheus URL from settings (in-cluster service)
+        self.prometheus_url = settings.prometheus.url
 
         # Initialize Kubernetes client
         self._init_kubernetes_client()

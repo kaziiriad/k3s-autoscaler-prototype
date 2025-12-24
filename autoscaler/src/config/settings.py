@@ -112,7 +112,7 @@ class AutoscalerSettings(BaseSettings):
     # Worker settings
     worker_prefix: str = os.getenv("AUTOSCALER_WORKER_PREFIX", "k3s-worker")
     permanent_workers: list = os.getenv("AUTOSCALER_PERMANENT_WORKERS", "k3s-worker-1,k3s-worker-2").split(",")
-    worker_start_number: int = int(os.getenv("AUTOSCALER_WORKER_START_NUMBER", "3"))
+    worker_start_number: int = int(os.getenv("AUTOSCALER_WORKER_START_NUMBER", "2"))
     worker_verification_timeout: int = int(os.getenv("AUTOSCALER_WORKER_VERIFICATION_TIMEOUT", "240"))
 
     # Token
@@ -137,7 +137,9 @@ class LoggingSettings(BaseSettings):
 
 class PrometheusSettings(BaseSettings):
     """Prometheus configuration settings"""
-    url: str = os.getenv("PROMETHEUS_URL", "http://prometheus:9090")
+    # Default to NodePort on master node for autoscaler running outside cluster
+    # Use environment variable PROMETHEUS_URL for in-cluster DNS (e.g., http://prometheus.monitoring.svc.cluster.local:9090)
+    url: str = os.getenv("PROMETHEUS_URL", "http://k3s-master:30900")
     query_timeout: int = int(os.getenv("PROMETHEUS_QUERY_TIMEOUT", "5"))
 
     class Config:
