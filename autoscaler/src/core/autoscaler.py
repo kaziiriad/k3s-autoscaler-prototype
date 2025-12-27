@@ -87,12 +87,23 @@ class K3sAutoscaler:
         log_separator(logger, f"AUTOSCALING CYCLE #{cycle_number}", 60)
 
         try:
-            # Collect metrics
+            # Collect metrics from Prometheus ONLY
             log_section(logger, "METRICS COLLECTION")
-            metrics_data = self.metrics.collect()
-            logger.info(f"Collected metrics: {metrics_data.current_nodes} nodes, "
-                       f"{metrics_data.pending_pods} pending, "
-                       f"CPU: {metrics_data.avg_cpu:.1f}%, Memory: {metrics_data.avg_memory:.1f}%")
+            try:
+                metrics_data = self.metrics.collect()
+                logger.info(f"Collected metrics: {metrics_data.current_nodes} nodes, "
+                           f"{metrics_data.pending_pods} pending, "
+                           f"CPU: {metrics_data.avg_cpu:.1f}%, Memory: {metrics_data.avg_memory:.1f}%")
+            except RuntimeError as prometheus_error:
+                # Prometheus metrics are unavailable - skip this cycle
+                logger.error(f"Prometheus metrics unavailable, skipping scaling cycle: {prometheus_error}")
+                logger.warning("Scaling decisions require Prometheus - cannot proceed without metrics")
+                return {
+                    "metrics": None,
+                    "decision": {"should_scale": False, "reason": "Prometheus unavailable"},
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "skipped": True
+                }
 
             # Make scaling decision
             log_section(logger, "SCALING DECISION")
@@ -209,41 +220,11 @@ class K3sAutoscaler:
     def _scale_up(self, count: int, decision: Dict[str, Any]) -> bool:
         """Scale up by adding worker nodes using async operations"""
         logger.info(f"Scaling up by {count} nodes (async mode)")
-    # Defensive check: Verify counter is not corrupted
-        try:
-            if hasattr(self.database, 'redis') and self.database.redis:
-                current_counter = int(self.database.redis.get("workers:next_number") or settings.autoscaler.worker_start_number)
-                
-                # Get all existing workers
-                all_workers = self.database.get_all_workers()
-                if all_workers:
-                    max_existing = max(
-                        int(w.node_name.split('-')[-1]) 
-                        for w in all_workers 
-                        if w.node_name.split('-')[-1].isdigit()
-                    )
-                    
-                    if current_counter <= max_existing:
-                        logger.warning(
-                            f"Counter corruption detected: counter={current_counter}, "
-                            f"max_existing={max_existing}. Fixing..."
-                        )
-                        self.database.redis.set("workers:next_number", max_existing + 1)
-        except Exception as e:
-            logger.warning(f"Could not verify counter: {e}")
 
-        # Check both cooldowns to prevent rapid oscillation
-        if self.database.is_cooldown_active("scale_up"):
-            remaining = self.database.get_cooldown_remaining("scale_up")
-            logger.info(f"Scale up cooldown active: {remaining}s remaining")
-            return False
+        # NOTE: Cooldown is checked in ScalingEngine.evaluate_scaling() before calling this.
+        # This execution layer trusts the decision and does not re-check cooldown.
 
-        # Also check if scale_down is recently active (optional: prevent immediate reverse scaling)
-        # if self.database.is_cooldown_active("scale_down"):
-        #     remaining = self.database.get_cooldown_remaining("scale_down")
-        #     logger.info(f"Recent scale down, waiting: {remaining}s remaining")
-        #     return False
-
+        # Redis is the single source of truth for worker numbering - do not modify it here
         try:
             # Initialize Docker client if not already done
             if not hasattr(self, 'docker_client'):
@@ -305,17 +286,8 @@ class K3sAutoscaler:
         """Scale down by removing worker nodes using async operations"""
         logger.info(f"Scaling down by {count} nodes (async mode)")
 
-        # Check both cooldowns to prevent rapid oscillation
-        if self.database.is_cooldown_active("scale_down"):
-            remaining = self.database.get_cooldown_remaining("scale_down")
-            logger.info(f"Scale down cooldown active: {remaining}s remaining")
-            return False
-
-        # CRITICAL: Also check if scale_up is active to prevent immediate reverse scaling
-        if self.database.is_cooldown_active("scale_up"):
-            remaining = self.database.get_cooldown_remaining("scale_up")
-            logger.info(f"Recent scale up, waiting: {remaining}s remaining before scale down")
-            return False
+        # NOTE: Cooldown is checked in ScalingEngine.evaluate_scaling() before calling this.
+        # This execution layer trusts the decision and does not re-check cooldown.
 
         # Get actual Kubernetes node count to make accurate minimum node decisions
         actual_k8s_nodes = 0

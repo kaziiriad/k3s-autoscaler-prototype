@@ -54,12 +54,9 @@ rules:
   - list
   - watch
 - apiGroups:
-  - extensions
+  - autoscaling
   resources:
-  - daemonsets
-  - deployments
-  - replicasets
-  - ingresses
+  - horizontalpodautoscalers
   verbs:
   - list
   - watch
@@ -71,25 +68,6 @@ rules:
   - list
   - watch
 - apiGroups:
-  - autoscaling
-  resources:
-  - horizontalpodautoscalers
-  verbs:
-  - list
-  - watch
-- apiGroups:
-  - authentication.k8s.io
-  resources:
-  - tokenreviews
-  verbs:
-  - create
-- apiGroups:
-  - authorization.k8s.io
-  resources:
-  - subjectaccessreviews
-  verbs:
-  - create
-- apiGroups:
   - storage.k8s.io
   resources:
   - storageclasses
@@ -97,90 +75,6 @@ rules:
   verbs:
   - list
   - watch
-- apiGroups:
-  - admissionregistration.k8s.io
-  resources:
-  - mutatingwebhookconfigurations
-  - validatingwebhookconfigurations
-  verbs:
-  - list
-  - watch
-- apiGroups:
-  - networking.k8s.io
-  resources:
-  - networkpolicies
-  - ingresses
-  verbs:
-  - list
-  - watch
-- apiGroups:
-  - coordination.k8s.io
-  resources:
-  - leases
-  verbs:
-  - list
-  - watch
-- apiGroups:
-  - node.k8s.io
-  resources:
-  - runtimeclasses
-  verbs:
-  - list
-  - watch
-- apiGroups:
-  - scheduling.k8s.io
-  resources:
-  - priorityclasses
-  verbs:
-  - list
-  - watch
-- apiGroups:
-  - certificates.k8s.io
-  resources:
-  - certificatesigningrequests
-  verbs:
-  - list
-  - watch
-- apiGroups:
-  - apps
-  resources:
-  - controllerrevisions
-  verbs:
-  - list
-  - watch
-- apiGroups:
-  - discovery.k8s.io
-  resources:
-  - endpointslices
-  verbs:
-  - list
-  - watch
-- apiGroups:
-  - flowcontrol.apiserver.k8s.io
-  resources:
-  - flowschemas
-  - prioritylevelconfigurations
-  verbs:
-  - list
-  - watch
-- apiGroups:
-  - rbac.authorization.k8s.io
-  resources:
-  - clusterroles
-  - clusterrolebindings
-  - roles
-  - rolebindings
-  verbs:
-  - list
-  - watch
-- apiGroups:
-  - metrics.k8s.io
-  resources:
-  - podmetrics
-  - nodemetrics
-  verbs:
-  - list
-  - get
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -213,11 +107,11 @@ spec:
   - name: http-metrics
     port: 8080
     protocol: TCP
-    targetPort: http-metrics
+    targetPort: 8080
   - name: telemetry
     port: 8081
     protocol: TCP
-    targetPort: telemetry
+    targetPort: 8081
   selector:
     app.kubernetes.io/name: kube-state-metrics
 ---
@@ -246,13 +140,12 @@ spec:
       - args:
         - --port=8080
         - --telemetry-port=8081
-        - --resources=certificatesigningrequests,configmaps,cronjobs,daemonsets,deployments,endpoints,horizontalpodautoscalers,ingresses,jobs,leases,limitranges,mutatingwebhookconfigurations,namespaces,networkpolicies,nodes,persistentvolumeclaims,persistentvolumes,poddisruptionbudgets,pods,replicasets,replicationcontrollers,resourcequotas,secrets,services,serviceaccounts,statefulsets,storageclasses,validatingwebhookconfigurations,volumeattachments,priorityclasses,flowschemas,prioritylevelconfigurations,leases,endpointslices,controllerrevisions,runtimeclasses,podmetrics,nodemetrics,clusterroles,clusterrolebindings,roles,rolebindings
         image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.10.0
         livenessProbe:
           failureThreshold: 3
           httpGet:
             path: /healthz
-            port: http-metrics
+            port: 8080
             scheme: HTTP
           initialDelaySeconds: 5
           periodSeconds: 10
@@ -269,7 +162,7 @@ spec:
           failureThreshold: 3
           httpGet:
             path: /healthz
-            port: http-metrics
+            port: 8080
             scheme: HTTP
           initialDelaySeconds: 5
           periodSeconds: 10
@@ -281,45 +174,4 @@ spec:
           requests:
             cpu: 100m
             memory: 100Mi
-        securityContext:
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - ALL
-          readOnlyRootFilesystem: true
-          runAsNonRoot: true
-          runAsUser: 65534
-      - args:
-        - --secure-listen-address=:8080
-        - --tls-cipher-suites=TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305
-        - --upstream=http://127.0.0.1:8081/
-        image: registry.k8s.io/kube-rbac-proxy:v0.13.1
-        name: kube-rbac-proxy
-        ports:
-        - containerPort: 8080
-          name: https-main
-          protocol: TCP
-        resources:
-          limits:
-            cpu: 500m
-            memory: 100Mi
-          requests:
-            cpu: 5m
-            memory: 50Mi
-        securityContext:
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - ALL
-          readOnlyRootFilesystem: true
-          runAsGroup: 65532
-          runAsNonRoot: true
-          runAsUser: 65532
-      nodeSelector:
-        kubernetes.io/os: linux
-      securityContext:
-        fsGroup: 65532
-        runAsGroup: 65532
-        runAsNonRoot: true
-        runAsUser: 65532
       serviceAccountName: kube-state-metrics

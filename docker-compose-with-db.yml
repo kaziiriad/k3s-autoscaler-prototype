@@ -197,28 +197,29 @@ services:
     volumes:
       - grafana-data:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./monitoring/grafana/k3s-cluster-dashboard.json:/var/lib/grafana/dashboards/k3s-cluster-dashboard.json:ro
-      - ./monitoring/grafana/dashboards/reconciliation-dashboard.json:/var/lib/grafana/dashboards/reconciliation-dashboard.json:ro
-      - ./monitoring/grafana/dashboards/event-dashboard.json:/var/lib/grafana/dashboards/event-dashboard.json:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_PATHS_PROVISIONING=/etc/grafana/provisioning
+      - GF_SERVER_ROOT_URL=http://localhost:3000
     networks:
       - k3s-network
-    # depends_on:
-    #   - prometheus  # Prometheus is now in-cluster
     restart: unless-stopped
 
   # Autoscaler Service
   autoscaler:
     image: custom-autoscaler:latest
+    build:
+      context: ./autoscaler
+      dockerfile: Dockerfile
     ports:
       - "8080:8080"
       - "9091:9091"
     volumes:
       - ./kubeconfig:/app/kubeconfig:ro
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./autoscaler/config:/app/config:ro
+      # - ./autoscaler/config:/app/config:ro  # Use baked-in config
     # Add group ID for Docker socket access
     group_add:
       - ${DOCKER_GID:-999}
@@ -235,6 +236,7 @@ services:
       - RECONCILIATION_ENABLED=true
       - RECONCILIATION_INTERVAL=60  # seconds
       - STARTUP_RECONCILIATION=true
+      - AUTOSCALER_DRY_RUN=true
 
     networks:
       - k3s-network

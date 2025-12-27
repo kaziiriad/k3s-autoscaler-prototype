@@ -53,7 +53,7 @@ data:
       # Kube-state-metrics for Kubernetes object metrics
       - job_name: 'kube-state-metrics'
         static_configs:
-          - targets: ['kube-state-metrics.kube-system.svc.cluster.local:8081']
+          - targets: ['kube-state-metrics.kube-system.svc.cluster.local:8080']
         scrape_interval: 30s
 
       # Autoscaler metrics

@@ -1,7 +1,7 @@
 # Autoscaler Configuration with Database Support
 autoscaler:
   check_interval: 5                # Check every 5 seconds
-  dry_run: false                   # Set to false to actually scale containers
+  dry_run: true                    # Set to false to actually scale containers
 
   # Kubernetes connection settings
   kubernetes:
@@ -51,7 +51,7 @@ autoscaler:
 logging:
   level: "INFO"
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-  file: "/app/autoscaler.log"
+  file: null  # Disable file logging in dry-run mode
 
 # Alerting
 alerting:

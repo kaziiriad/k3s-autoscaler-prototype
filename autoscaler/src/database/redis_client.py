@@ -475,3 +475,39 @@ class AutoscalerRedisClient(RedisClient):
             check_type = key.split(":")[-1]
             health_data[check_type] = self.get(f"health:{node_name}:{check_type}")
         return health_data
+
+    # Worker counter operations - Redis is single source of truth
+    def get_next_worker_number(self) -> int:
+        """Get the next worker number (without incrementing)"""
+        return int(self.get("workers:next_number", default=0))
+
+    def increment_worker_counter(self) -> int:
+        """Atomically increment and return the next worker number"""
+        return self.increment("workers:next_number", 1)
+
+    def decrement_worker_counter(self) -> int:
+        """
+        Safely decrement worker counter.
+        Only call this when rolling back a failed worker creation.
+        Returns the new counter value.
+        """
+        current = self.get("workers:next_number", deserialize=False, default="0")
+        try:
+            current_val = int(current)
+            if current_val > 1:
+                new_val = self.decrement("workers:next_number", 1)
+                logger.info(f"Decremented worker counter: {current_val} → {new_val}")
+                return new_val
+            else:
+                logger.warning(f"Worker counter at minimum ({current_val}), not decrementing")
+                return current_val
+        except ValueError:
+            logger.error(f"Invalid worker counter value: {current}")
+            return 0
+
+    def set_worker_counter(self, value: int) -> bool:
+        """
+        Set worker counter to a specific value.
+        Only used by reconciliation to fix corruption.
+        """
+        return self.set("workers:next_number", value, serialize=False)

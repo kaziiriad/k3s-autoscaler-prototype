@@ -34,9 +34,13 @@ class StartupReconciler:
         self.config = autoscaler.config
         self.database = autoscaler.database
         self.worker_prefix = autoscaler.worker_prefix
-        
-        # Initialize Docker client
-        if not hasattr(autoscaler, 'docker_client'):
+        self.dry_run = self.config.get('autoscaler', {}).get('dry_run', False)
+
+        # Initialize Docker client (skip in dry-run mode)
+        if self.dry_run:
+            self.docker_client = None
+            logger.info("Dry-run mode: Docker client disabled")
+        elif not hasattr(autoscaler, 'docker_client'):
             self.docker_client = docker.from_env()
         else:
             self.docker_client = autoscaler.docker_client
@@ -121,19 +125,22 @@ class StartupReconciler:
             "k8s_nodes": set()
         }
 
-        # Get Docker containers
-        try:
-            containers = self.docker_client.containers.list(all=True)
-            for container in containers:
-                if container.name and container.name.startswith(self.worker_prefix):
-                    state["docker_containers"][container.name] = {
-                        "id": container.id[:12],
-                        "status": container.status,
-                        "running": container.status == "running"
-                    }
-            logger.info(f"Found {len(state['docker_containers'])} Docker containers")
-        except Exception as e:
-            logger.error(f"Failed to get Docker containers: {e}")
+        # Get Docker containers (skip in dry-run mode)
+        if self.dry_run:
+            logger.info("Dry-run mode: Skipping Docker container discovery")
+        else:
+            try:
+                containers = self.docker_client.containers.list(all=True)
+                for container in containers:
+                    if container.name and container.name.startswith(self.worker_prefix):
+                        state["docker_containers"][container.name] = {
+                            "id": container.id[:12],
+                            "status": container.status,
+                            "running": container.status == "running"
+                        }
+                logger.info(f"Found {len(state['docker_containers'])} Docker containers")
+            except Exception as e:
+                logger.error(f"Failed to get Docker containers: {e}")
 
         # Get Redis workers (source of truth for worker state)
         try:
@@ -288,12 +295,14 @@ class StartupReconciler:
         return actions
     
     def _fix_worker_counter(self, state: Dict) -> Optional[str]:
-        """Fix the worker counter in Redis - ensure it NEVER decreases
+        """
+        Fix the worker counter in Redis using the Redis client's helper method.
 
-        Only considers Docker containers and Redis (source of truth).
+        Redis is the single source of truth for worker numbering.
+        This method ensures counter NEVER decreases below the maximum existing worker number.
         """
         try:
-            # Get highest worker number from Docker
+            # Get highest worker number from Docker (source of truth for existing containers)
             max_num = 0
             for worker_name in state["docker_containers"].keys():
                 try:
@@ -313,8 +322,8 @@ class StartupReconciler:
             # Counter should be at least max_num + 1
             correct_counter = max_num + 1
 
-            # Get current counter from Redis
-            current_counter = int(self.database.redis.get("workers:next_number") or 0)
+            # Get current counter from Redis using the helper method
+            current_counter = self.database.redis.get_next_worker_number()
 
             # CRITICAL: Counter should NEVER decrease
             if current_counter < correct_counter:
@@ -322,13 +331,14 @@ class StartupReconciler:
                     f"Worker counter is too low: {current_counter} "
                     f"(should be at least {correct_counter} based on existing workers)"
                 )
-                self.database.redis.set("workers:next_number", correct_counter)
+                # Use the Redis client's set_worker_counter method
+                self.database.redis.set_worker_counter(correct_counter)
                 logger.info(f"✓ Fixed worker counter: {current_counter} → {correct_counter}")
                 return f"Fixed worker counter: {current_counter} → {correct_counter}"
             elif current_counter > correct_counter:
                 logger.info(
                     f"Worker counter is ahead of existing workers: {current_counter} > {correct_counter}. "
-                    f"This is normal if workers were created and removed. Keeping current value."
+                    f"This is normal if workers were created and rolled back. Keeping current value."
                 )
                 return None
             else:

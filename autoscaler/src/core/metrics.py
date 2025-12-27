@@ -97,10 +97,15 @@ class MetricsCollector:
 
     def collect(self) -> ClusterMetrics:
         """
-        Collect all metrics
+        Collect all metrics from Prometheus ONLY.
+
+        Kubernetes API is ONLY used for operations (drain, verify), NOT for scaling decisions.
 
         Returns:
             ClusterMetrics object containing collected metrics
+
+        Raises:
+            RuntimeError: If Prometheus metrics are unavailable
         """
         # Initialize with default values
         metrics_dict = {
@@ -116,12 +121,18 @@ class MetricsCollector:
         }
 
         try:
-            # Get node count from Kubernetes API
-            if self.k8s_api:
-                metrics_dict.update(self._get_kubernetes_metrics())
-
-            # Get detailed metrics from Prometheus
+            # CRITICAL: Get ALL metrics from Prometheus only
+            # Kubernetes API is NOT used for scaling decisions
             prometheus_metrics = self._get_prometheus_metrics()
+
+            # Check if Prometheus returned valid data
+            # If CPU/Memory are 0.0, Prometheus might be down
+            if prometheus_metrics["avg_cpu"] == 0.0 and prometheus_metrics["avg_memory"] == 0.0:
+                raise RuntimeError(
+                    "Prometheus metrics unavailable - cannot make scaling decisions. "
+                    "CPU: 0.0%, Memory: 0.0% indicates Prometheus is not responding or has no data."
+                )
+
             metrics_dict.update(prometheus_metrics)
 
             # Convert to Pydantic model
@@ -129,9 +140,9 @@ class MetricsCollector:
             return metrics
 
         except Exception as e:
-            logger.error(f"Error collecting metrics: {e}")
-            # Return default metrics on error
-            return ClusterMetrics(**metrics_dict)
+            logger.error(f"Error collecting Prometheus metrics: {e}")
+            # Raise error to prevent scaling decisions based on incomplete data
+            raise RuntimeError(f"Cannot collect metrics from Prometheus: {e}")
 
     def _get_kubernetes_metrics(self) -> Dict[str, Any]:
         """Get metrics from Kubernetes API"""
@@ -204,8 +215,20 @@ class MetricsCollector:
         return metrics
 
     def _get_prometheus_metrics(self) -> Dict[str, Any]:
-        """Get metrics from Prometheus"""
+        """
+        Get ALL metrics from Prometheus ONLY.
+
+        This includes:
+        - CPU/Memory usage
+        - Node counts (worker nodes)
+        - Pending pods
+
+        Kubernetes API is NOT used for scaling decisions.
+        """
         metrics = {
+            "current_nodes": 0,
+            "ready_nodes": 0,
+            "pending_pods": 0,
             "avg_cpu": 0.0,
             "avg_memory": 0.0,
             "total_cpu": 0.0,
@@ -225,6 +248,17 @@ class MetricsCollector:
                 'avg((1 - (node_memory_MemAvailable_bytes{job="node-exporter-k3s-nodes"} / node_memory_MemTotal_bytes{job="node-exporter-k3s-nodes"})) * 100)'
             )
 
+            # Get worker node count from Prometheus (exclude master/control-plane)
+            # Approach: Count all nodes, then subtract control-plane nodes
+            all_nodes_response = self._query_prometheus('count(kube_node_info)')
+            # Count nodes with control-plane role label (label is converted to underscores in Prometheus)
+            control_plane_response = self._query_prometheus('count(kube_node_info{node_role_kubernetes_io_control_plane="true"})')
+
+            # Get pending pods from Prometheus
+            pending_pods_response = self._query_prometheus(
+                'count(kube_pod_status_phase{phase="Pending"})'
+            )
+
             # Get CPU requests and allocatable
             cpu_requests_response = self._query_prometheus(
                 'sum(kube_pod_container_resource_requests{resource="cpu"})'
@@ -240,6 +274,19 @@ class MetricsCollector:
             mem_allocatable_response = self._query_prometheus(
                 'sum(kube_node_status_allocatable{resource="memory"})'
             )
+
+            # Process node counts
+            if all_nodes_response and len(all_nodes_response) > 0:
+                all_nodes = int(float(all_nodes_response[0]["value"][1]))
+                control_plane = 0
+                if control_plane_response and len(control_plane_response) > 0:
+                    control_plane = int(float(control_plane_response[0]["value"][1]))
+                metrics["current_nodes"] = max(0, all_nodes - control_plane)
+                metrics["ready_nodes"] = metrics["current_nodes"]  # Assume ready if not cordoned
+
+            # Process pending pods
+            if pending_pods_response and len(pending_pods_response) > 0:
+                metrics["pending_pods"] = int(float(pending_pods_response[0]["value"][1]))
 
             # Process CPU metrics
             if cpu_response and len(cpu_response) > 0:
@@ -269,7 +316,7 @@ class MetricsCollector:
                 metrics["total_memory_gb"] = metrics["total_memory"] / (1024**3)
                 metrics["allocatable_memory_gb"] = metrics["allocatable_memory"] / (1024**3)
 
-            logger.debug(f"Prometheus metrics: cpu={metrics['avg_cpu']:.1f}%, memory={metrics['avg_memory']:.1f}%")
+            logger.info(f"Prometheus metrics: nodes={metrics['current_nodes']}, pending={metrics['pending_pods']}, cpu={metrics['avg_cpu']:.1f}%, memory={metrics['avg_memory']:.1f}%")
 
         except Exception as e:
             logger.error(f"Error getting Prometheus metrics: {e}")

@@ -123,24 +123,33 @@ class AsyncScalingManager:
 
             verification_results = await asyncio.gather(*verification_tasks, return_exceptions=True)
 
-            # Update database with verified nodes
-            database_updates = []
+            # Separate verified workers from failed ones
+            verified_workers = []
+            failed_workers = []
+
             for worker, verified in zip(successful_workers, verification_results):
                 if isinstance(verified, dict) and verified.get('ready', False):
                     worker.status = NodeStatus.READY
                     worker.launched_at = datetime.now(timezone.utc)
-                    database_updates.append(worker)
+                    verified_workers.append(worker)
                 else:
-                    # Keep as INITIALIZING if verification failed/timed out
-                    # The container exists, so we should track it
-                    worker.status = NodeStatus.INITIALIZING
-                    database_updates.append(worker)
-                    logger.warning(f"Node {worker.node_name} verification timed out, but container exists. Keeping as INITIALIZING.")
+                    # Verification failed - mark for cleanup
+                    error_msg = verified.get('message', 'Unknown error') if isinstance(verified, dict) else str(verified)
+                    logger.error(f"Node {worker.node_name} verification failed: {error_msg}")
+                    failed_workers.append((worker, error_msg))
 
-            # Update database concurrently
-            if database_updates:
+            # TODO(human): Implement rollback strategy for failed workers
+            # Options to consider:
+            # 1. Immediately remove failed workers (aggressive - may cause cascading failures)
+            # 2. Retry verification once (moderate - adds complexity)
+            # 3. Mark as FAILED and let reconciliation handle it (passive - preferred for production)
+            #
+            # For now: Only add verified workers to database, clean up failed containers
+
+            # Add verified workers to database concurrently
+            if verified_workers:
                 db_tasks = []
-                for worker in database_updates:
+                for worker in verified_workers:
                     task = asyncio.get_event_loop().run_in_executor(
                         self.thread_pool,
                         database.add_worker,
@@ -151,9 +160,17 @@ class AsyncScalingManager:
                 db_results = await asyncio.gather(*db_tasks, return_exceptions=True)
 
                 # Log any database errors
-                for worker, result in zip(database_updates, db_results):
+                for worker, result in zip(verified_workers, db_results):
                     if isinstance(result, Exception):
                         error_messages.append(f"DB error for {worker.node_name}: {str(result)}")
+
+            # Clean up failed workers - remove containers and rollback worker numbers
+            if failed_workers:
+                logger.warning(f"Cleaning up {len(failed_workers)} failed workers")
+                for worker, error_msg in failed_workers:
+                    success = self._cleanup_failed_worker(worker, docker_client, error_msg)
+                    if not success:
+                        error_messages.append(f"Cleanup failed for {worker.node_name}: {error_msg}")
 
         elapsed = time.time() - start_time
         logger.info(f"Concurrent scale-up completed in {elapsed:.2f}s: "
@@ -306,11 +323,11 @@ class AsyncScalingManager:
         while (time.time() - start_time) < timeout:
             try:
                 # Use thread pool for blocking Kubernetes API call
+                # Note: run_in_executor doesn't support kwargs, so use lambda or functools.partial
                 loop = asyncio.get_event_loop()
                 node = await loop.run_in_executor(
                     self.thread_pool,
-                    self.k8s_api.read_node,
-                    name=worker.node_name
+                    lambda: self.k8s_api.read_node(name=worker.node_name)
                 )
 
                 # Check if node is ready
@@ -389,8 +406,7 @@ class AsyncScalingManager:
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(
                     self.thread_pool,
-                    self.k8s_api.read_node,
-                    name=worker.node_name
+                    lambda: self.k8s_api.read_node(name=worker.node_name)
                 )
                 # Node still exists, wait
                 await asyncio.sleep(5)
@@ -401,18 +417,18 @@ class AsyncScalingManager:
         return {"removed": False, "message": f"Timeout waiting for {worker.node_name} removal"}
 
     def _create_worker_node_sync(self, worker_id: int, docker_client) -> Optional[WorkerNode]:
-        """Synchronous worker creation (runs in thread pool)"""
+        """Synchronous worker creation (runs in thread pool)
+
+        Uses Redis as the single source of truth for worker numbering.
+        Counter is incremented atomically to prevent race conditions.
+        """
         try:
-            # CRITICAL FIX: Atomically increment FIRST to reserve the number
-            # This prevents race conditions in concurrent scaling
-            if not self.redis_client.exists(self.worker_counter_key):
-                self.redis_client.set(self.worker_counter_key, settings.autoscaler.worker_start_number - 1)
-            
-            # Atomically get and increment - this reserves the number
-            worker_num = int(self.redis_client.increment(self.worker_counter_key))
+            # CRITICAL: Redis is the single source of truth for worker numbering
+            # Atomically increment to reserve the worker number
+            worker_num = self.redis_client.increment_worker_counter()
             node_name = f"{settings.autoscaler.worker_prefix}-{worker_num}"
-            
-            logger.info(f"Reserved worker number {worker_num}, creating {node_name}")
+
+            logger.info(f"Reserved worker number {worker_num} from Redis, creating {node_name}")
 
             # Create the container
             try:
@@ -447,39 +463,108 @@ class AsyncScalingManager:
                         'retries': 3
                     }
                 )
-                
+
                 logger.info(f"Successfully created worker {node_name} with reserved number {worker_num}")
-                
+
+                # Add worker to Redis sets for tracking
+                self.redis_client.set_add(REDIS_KEYS['WORKERS_ALL'], node_name)
+                self.redis_client.set_add(REDIS_KEYS['WORKERS_REMOVABLE'], node_name)
+
+                worker_node = WorkerNode(
+                    node_name=node_name,
+                    container_id=container.id,
+                    container_name=node_name,
+                    status=NodeStatus.INITIALIZING,
+                    launched_at=datetime.now(timezone.utc),
+                    metadata={
+                        "created_by": "autoscaler",
+                        "container_image": settings.docker.image,
+                        "network": settings.docker.network,
+                        "worker_id": worker_id,
+                        "worker_number": worker_num  # Store for rollback if needed
+                    }
+                )
+
+                return worker_node
+
             except Exception as e:
                 logger.error(f"Failed to create container for {node_name}: {e}")
-                # Don't decrement counter - skip this number to avoid reuse
-                logger.warning(f"Worker number {worker_num} will be skipped due to creation failure")
+                # Rollback: decrement the counter since container creation failed
+                self._rollback_worker_number(worker_num, f"Container creation failed: {e}")
                 return None
-
-            # Add worker to Redis sets
-            self.redis_client.set_add(REDIS_KEYS['WORKERS_ALL'], node_name)
-            self.redis_client.set_add(REDIS_KEYS['WORKERS_REMOVABLE'], node_name)
-
-            worker_node = WorkerNode(
-                node_name=node_name,
-                container_id=container.id,
-                container_name=node_name,
-                status=NodeStatus.INITIALIZING,
-                launched_at=datetime.now(timezone.utc),
-                metadata={
-                    "created_by": "autoscaler",
-                    "container_image": settings.docker.image,
-                    "network": settings.docker.network,
-                    "worker_id": worker_id,
-                    "worker_number": worker_num  # Store the number for reference
-                }
-            )
-
-            return worker_node
 
         except Exception as e:
             logger.error(f"Failed to create worker node: {e}")
             return None
+
+    def _rollback_worker_number(self, worker_num: int, reason: str) -> bool:
+        """
+        Rollback a worker number when creation fails.
+        This decrements the Redis counter to allow reuse of the number.
+
+        Args:
+            worker_num: The worker number to roll back
+            reason: Why the rollback is happening
+
+        Returns:
+            True if rollback succeeded, False otherwise
+        """
+        try:
+            logger.warning(f"Rolling back worker number {worker_num}: {reason}")
+            new_counter = self.redis_client.decrement_worker_counter()
+            logger.info(f"Worker counter rolled back. New counter value: {new_counter}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to rollback worker number {worker_num}: {e}")
+            return False
+
+    def _cleanup_failed_worker(self, worker: WorkerNode, docker_client, error_msg: str) -> bool:
+        """
+        Clean up a failed worker by removing container and rolling back worker number.
+
+        This implements the rollback strategy for failed workers:
+        1. Remove Docker container (if it exists)
+        2. Remove from Redis sets
+        3. Rollback worker number (decrement counter)
+
+        Args:
+            worker: The failed worker node
+            docker_client: Docker client instance
+            error_msg: Error message for logging
+
+        Returns:
+            True if cleanup succeeded, False otherwise
+        """
+        cleanup_success = True
+        worker_num = worker.metadata.get("worker_number") if worker.metadata else None
+
+        try:
+            # 1. Remove Docker container if it exists
+            try:
+                container = docker_client.containers.get(worker.container_id)
+                container.remove(force=True)
+                logger.info(f"Removed failed container: {worker.node_name}")
+            except Exception as container_error:
+                logger.warning(f"Could not remove container {worker.node_name}: {container_error}")
+
+            # 2. Remove from Redis sets
+            self.redis_client.set_remove(REDIS_KEYS['WORKERS_ALL'], worker.node_name)
+            self.redis_client.set_remove(REDIS_KEYS['WORKERS_REMOVABLE'], worker.node_name)
+
+            # 3. Delete worker hash entry
+            worker_hash_key = f"worker:{worker.node_name}"
+            self.redis_client.delete(worker_hash_key)
+
+            # 4. Rollback worker number if we have it
+            if worker_num:
+                self._rollback_worker_number(worker_num, f"Worker verification failed: {error_msg}")
+
+            logger.info(f"Successfully cleaned up failed worker: {worker.node_name}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to cleanup worker {worker.node_name}: {e}")
+            return False
         
     def _remove_worker_container_sync(self, worker: WorkerNode, docker_client) -> bool:
         """Synchronous container removal (runs in thread pool)"""
@@ -531,7 +616,8 @@ class AsyncScalingManager:
 
         try:
             patch_body = {"spec": {"unschedulable": True}}
-            self.k8s_api.patch_node(name=node_name, body=patch_body)
+            # Use positional arguments for patch_node
+            self.k8s_api.patch_node(node_name, patch_body)
         except Exception as e:
             # Re-raise the exception so the caller can handle it appropriately
             # This allows _drain_node_async to distinguish between different error types
