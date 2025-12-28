@@ -432,9 +432,14 @@ class StateReconciler:
                 logger.warning(f"Failed to publish reconciliation event: {e}")
     
     async def _verify_worker_counter(self, state: Dict) -> bool:
-        """Verify and fix worker counter. Returns True if counter was fixed."""
+        """
+        Verify and fix worker counter using Redis client's helper methods.
+        Returns True if counter was fixed.
+
+        Redis is the single source of truth for worker numbering.
+        """
         try:
-            # Get highest worker number from Docker
+            # Get highest worker number from Docker (source of truth for existing containers)
             max_num = 0
             for worker_name in state["docker"]:
                 try:
@@ -443,20 +448,21 @@ class StateReconciler:
                 except (ValueError, IndexError):
                     pass
 
-            # Get Redis counter
-            redis_counter = int(self.database.redis.get("workers:next_number") or 0)
+            # Get Redis counter using the helper method
+            redis_counter = self.database.redis.get_next_worker_number()
 
             # Counter should be at least max_num + 1, but NEVER less than current counter
             correct_counter = max(max_num + 1, redis_counter)
 
             if redis_counter < correct_counter:
                 logger.warning(
-                    f"Worker counter is wrong: {redis_counter} "
-                    f"(should be {correct_counter})"
+                    f"Worker counter is too low: {redis_counter} "
+                    f"(should be at least {correct_counter})"
                 )
-                self.database.redis.set("workers:next_number", correct_counter)
+                # Use the Redis client's set_worker_counter method
+                self.database.redis.set_worker_counter(correct_counter)
                 self.issues_fixed["counter_fixes"] += 1
-                logger.info(f"✓ Fixed worker counter: {correct_counter}")
+                logger.info(f"✓ Fixed worker counter: {redis_counter} → {correct_counter}")
                 return True
             else:
                 logger.debug(f"Worker counter is correct: {redis_counter} (max worker: {max_num})")

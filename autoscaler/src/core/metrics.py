@@ -249,14 +249,16 @@ class MetricsCollector:
             )
 
             # Get worker node count from Prometheus (exclude master/control-plane)
-            # Approach: Count all nodes, then subtract control-plane nodes
-            all_nodes_response = self._query_prometheus('count(kube_node_info)')
-            # Count nodes with control-plane role label (label is converted to underscores in Prometheus)
-            control_plane_response = self._query_prometheus('count(kube_node_info{node_role_kubernetes_io_control_plane="true"})')
+            # Use kube_node_role metric to identify control-plane nodes
+            workers_response = self._query_prometheus(
+                'count(kube_node_info) - count(kube_node_role{role="control-plane"})'
+            )
 
             # Get pending pods from Prometheus
+            # Use sum() not count() because KSM creates a time series for each phase (0 or 1)
+            # count() would count all time series, sum() adds up the actual values
             pending_pods_response = self._query_prometheus(
-                'count(kube_pod_status_phase{phase="Pending"})'
+                'sum(kube_pod_status_phase{phase="Pending"})'
             )
 
             # Get CPU requests and allocatable
@@ -276,12 +278,8 @@ class MetricsCollector:
             )
 
             # Process node counts
-            if all_nodes_response and len(all_nodes_response) > 0:
-                all_nodes = int(float(all_nodes_response[0]["value"][1]))
-                control_plane = 0
-                if control_plane_response and len(control_plane_response) > 0:
-                    control_plane = int(float(control_plane_response[0]["value"][1]))
-                metrics["current_nodes"] = max(0, all_nodes - control_plane)
+            if workers_response and len(workers_response) > 0:
+                metrics["current_nodes"] = int(float(workers_response[0]["value"][1]))
                 metrics["ready_nodes"] = metrics["current_nodes"]  # Assume ready if not cordoned
 
             # Process pending pods
