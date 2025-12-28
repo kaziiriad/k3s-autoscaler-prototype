@@ -187,8 +187,19 @@ class DatabaseManager:
         return self.workers.get_ready_nodes()
 
     def get_worker_count(self) -> int:
-        """Get worker node count"""
-        return self.workers.get_count()
+        """
+        Get worker node count using Redis sets.
+
+        Per Worker Number Strategy: Use Redis sets for worker tracking,
+        not the counter. The counter is for numbering only.
+        """
+        try:
+            from config.settings import REDIS_KEYS
+            # Use Redis set size instead of counter or MongoDB count
+            return self.redis.scard(REDIS_KEYS['WORKERS_ALL'])
+        except Exception as e:
+            logger.warning(f"Failed to get worker count from Redis, falling back to MongoDB: {e}")
+            return self.workers.get_count()
 
     def update_worker_status(self, node_name: str, status: NodeStatus) -> bool:
         """Update worker status"""

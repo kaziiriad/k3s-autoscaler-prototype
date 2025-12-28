@@ -453,6 +453,277 @@ class AutoscalerRedisClient(RedisClient):
         """Release a distributed lock"""
         self.delete(f"locks:{resource}")
 
+    # ========================================================================
+    # UUID-BASED DISTRIBUTED LOCK (Production-grade)
+    # ========================================================================
+
+    def acquire_scaling_lock(self, ttl: int = 120) -> Optional[str]:
+        """
+        Acquire scaling lock with unique ID.
+
+        Args:
+            ttl: Lock time-to-live in seconds (auto-releases if crashed)
+
+        Returns:
+            Lock ID if acquired, None if lock already held
+        """
+        import uuid
+        lock_key = self._make_key("scaling:operation_in_progress")
+        lock_id = str(uuid.uuid4())
+
+        # Use SET NX EX for atomic lock acquisition
+        acquired = self.client.set(lock_key, lock_id, nx=True, ex=ttl)
+
+        if acquired:
+            logger.info(f"Acquired scaling lock: {lock_id[:8]}...")
+            return lock_id
+        else:
+            # Get existing lock info for debugging
+            existing = self.client.get(lock_key)
+            logger.debug(f"Scaling lock already held: {existing[:20] if existing else 'unknown'}...")
+            return None
+
+    def release_scaling_lock(self, lock_id: str) -> bool:
+        """
+        Release scaling lock only if we own it (Lua script).
+
+        Args:
+            lock_id: The lock ID we received when acquiring
+
+        Returns:
+            True if released, False if lock changed or missing
+        """
+        lock_key = self._make_key("scaling:operation_in_progress")
+
+        # Lua script for safe release (only release our lock)
+        lua_script = """
+        if redis.call("GET", KEYS[1]) == ARGV[1] then
+            redis.call("DEL", KEYS[1])
+            return 1
+        else
+            return 0
+        end
+        """
+
+        try:
+            result = self.client.eval(lua_script, 1, lock_key, lock_id)
+            if result == 1:
+                logger.info(f"Released scaling lock: {lock_id[:8]}...")
+                return True
+            else:
+                logger.warning(f"Lock value changed or missing: {lock_id[:8]}...")
+                return False
+        except Exception as e:
+            logger.error(f"Failed to release scaling lock: {e}")
+            # Force delete as last resort
+            try:
+                self.client.delete(lock_key)
+                logger.warning("Force-deleted scaling lock after release error")
+                return True
+            except Exception as e2:
+                logger.error(f"Failed to force-delete lock: {e2}")
+                return False
+
+    # ========================================================================
+    # COMPARE-AND-SWAP (CAS) for atomic state transitions
+    # ========================================================================
+
+    def cas_transition(self, worker_name: str, from_state: str, to_state: str,
+                       metadata: Optional[Dict] = None) -> bool:
+        """
+        Compare-and-Swap: Atomically transition worker state if current state matches.
+
+        This prevents race conditions where multiple processes try to update
+        the same worker's state simultaneously.
+
+        Args:
+            worker_name: Name of the worker (e.g., "k3s-worker-1")
+            from_state: Expected current state
+            to_state: New state to transition to
+            metadata: Optional metadata to include in the transition
+
+        Returns:
+            True if transition succeeded, False if state didn't match
+        """
+        worker_key = self._make_key(f"workers:{worker_name}")
+        timestamp = datetime.now(timezone.utc).isoformat()
+
+        # Lua script for atomic CAS operation
+        lua_script = """
+        local key = KEYS[1]
+        local expected_state = ARGV[1]
+        local new_state = ARGV[2]
+        local timestamp = ARGV[3]
+
+        local current_state = redis.call("HGET", key, "state")
+        if current_state == expected_state then
+            redis.call("HSET", key, "state", new_state)
+            redis.call("HSET", key, "state_updated_at", timestamp)
+            return 1
+        else
+            return 0
+        end
+        """
+
+        try:
+            result = self.client.eval(
+                lua_script,
+                1,  # Number of keys
+                worker_key,
+                from_state,
+                to_state,
+                timestamp
+            )
+
+            if result == 1:
+                logger.info(f"CAS success: {worker_name} {from_state} → {to_state}")
+                return True
+            else:
+                logger.debug(f"CAS failed: {worker_name} state changed by another process")
+                return False
+
+        except Exception as e:
+            logger.error(f"CAS transition failed for {worker_name}: {e}")
+            return False
+
+    def get_worker_state(self, worker_name: str) -> Optional[str]:
+        """Get current worker state"""
+        worker_key = self._make_key(f"workers:{worker_name}")
+        return self.hget(worker_key, "state")
+
+    def set_worker_state(self, worker_name: str, state: str, metadata: Optional[Dict] = None):
+        """Set worker state (use only for initial state, not transitions)"""
+        worker_key = self._make_key(f"workers:{worker_name}")
+        data = {
+            "state": state,
+            "state_updated_at": datetime.now(timezone.utc).isoformat()
+        }
+        if metadata:
+            data.update(metadata)
+        self.hset(worker_key, mapping=data)
+
+    # ========================================================================
+    # WRITE-AHEAD LOG (WAL) for crash recovery
+    # ========================================================================
+
+    def wal_begin_operation(self, operation_type: str, worker_name: str,
+                           worker_number: int, metadata: Optional[Dict] = None) -> str:
+        """
+        Begin a scaling operation in the Write-Ahead Log.
+
+        WAL allows recovery from incomplete operations after crashes.
+        Operations are logged BEFORE execution, enabling rollback/complete.
+
+        Args:
+            operation_type: "scale_up" or "scale_down"
+            worker_name: Name of the worker (e.g., "k3s-worker-1")
+            worker_number: Reserved worker number
+            metadata: Optional additional metadata
+
+        Returns:
+            operation_id: Unique ID for tracking this operation
+        """
+        import uuid
+
+        operation_id = str(uuid.uuid4())
+        operation_key = f"scaling:wal:{operation_id}"
+
+        operation_data = {
+            "operation_id": operation_id,
+            "operation_type": operation_type,
+            "worker_name": worker_name,
+            "worker_number": str(worker_number),
+            "state": "started",
+            "started_at": datetime.now(timezone.utc).isoformat()
+        }
+
+        if metadata:
+            operation_data.update(metadata)
+
+        # Write to WAL (1 hour TTL)
+        self.hset(operation_key, mapping=operation_data)
+        self.client.expire(self._make_key(operation_key), 3600)
+
+        logger.info(f"WAL: Began {operation_type} operation {operation_id[:8]}... for {worker_name}")
+        return operation_id
+
+    def wal_update_state(self, operation_id: str, state: str, error: Optional[str] = None):
+        """
+        Update operation state in WAL.
+
+        Args:
+            operation_id: Operation ID from wal_begin_operation
+            state: New state (e.g., "creating", "verifying", "completed", "failed")
+            error: Optional error message if operation failed
+        """
+        operation_key = f"scaling:wal:{operation_id}"
+
+        updates = {
+            "state": state,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }
+
+        if error:
+            updates["error"] = error
+
+        if state in ["completed", "failed"]:
+            updates["completed_at"] = datetime.now(timezone.utc).isoformat()
+
+        self.hset(operation_key, mapping=updates)
+        logger.debug(f"WAL: Updated {operation_id[:8]}... → {state}")
+
+    def wal_complete(self, operation_id: str, success: bool = True):
+        """
+        Mark operation as complete in WAL.
+
+        Args:
+            operation_id: Operation ID from wal_begin_operation
+            success: True if operation succeeded, False if failed
+        """
+        final_state = "completed" if success else "failed"
+        self.wal_update_state(operation_id, final_state)
+        logger.info(f"WAL: Completed {operation_id[:8]}... (success={success})")
+
+    def wal_get_incomplete(self) -> List[Dict]:
+        """
+        Get all incomplete operations from WAL (for crash recovery).
+
+        Returns:
+            List of incomplete operation dicts
+        """
+        pattern = "scaling:wal:*"
+        operations = []
+
+        try:
+            keys = self.get_all_keys(pattern)
+            for key in keys:
+                # Extract operation ID from key
+                if key.startswith("scaling:wal:"):
+                    op_id = key.split(":")[-1]
+                    data = self.hgetall(key)
+
+                    # Check if incomplete (no completed_at)
+                    if data and not data.get("completed_at"):
+                        operations.append({
+                            "operation_id": op_id,
+                            "operation_type": data.get("operation_type"),
+                            "worker_name": data.get("worker_name"),
+                            "worker_number": int(data.get("worker_number", 0)),
+                            "state": data.get("state", "unknown"),
+                            "started_at": data.get("started_at"),
+                            "error": data.get("error")
+                        })
+        except Exception as e:
+            logger.error(f"Failed to get incomplete WAL operations: {e}")
+
+        return operations
+
+    def wal_delete(self, operation_id: str):
+        """Delete operation from WAL (after successful recovery)"""
+        operation_key = f"scaling:wal:{operation_id}"
+        self.delete(operation_key)
+        logger.debug(f"WAL: Deleted {operation_id[:8]}...")
+
     # Health checks
     def record_health_check(self, node_name: str, check_type: str, status: str,
                             message: str = "", response_time: Optional[float] = None):

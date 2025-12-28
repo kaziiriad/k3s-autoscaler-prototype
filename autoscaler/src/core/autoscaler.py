@@ -56,6 +56,10 @@ class K3sAutoscaler:
 
         logger.info("K3s Autoscaler initialized with database support and async operations")
 
+        # Perform WAL recovery before startup reconciliation
+        logger.info("Checking for incomplete operations from WAL...")
+        self._recover_from_wal()
+
         # Perform startup reconciliation to ensure data integrity
         logger.info("Performing startup reconciliation...")
         from core.startup_reconciliation import StartupReconciler
@@ -158,46 +162,27 @@ class K3sAutoscaler:
             }
 
     def _execute_scaling(self, decision: Dict[str, Any], metrics: Dict[str, Any] = None) -> bool:
-        """Execute a scaling decision"""
+        """
+        Execute a scaling decision with UUID-based distributed lock.
+
+        The lock ensures only one scaling operation runs at a time across
+        multiple autoscaler instances.
+        """
         action = decision['action']
         count = decision.get('count', 1)
 
-        # Check if scaling operation already in progress
+        # Acquire scaling lock with UUID (prevents race conditions)
+        lock_id = None
         if hasattr(self.database, 'redis') and self.database.redis:
-            lock_key = REDIS_KEYS['SCALING_LOCK']
+            # Use new UUID-based lock with 120s TTL
+            lock_id = self.database.redis.acquire_scaling_lock(ttl=120)
 
-            # Check if lock exists and when it was created
-            if self.database.redis.exists(lock_key):
-                # Get the lock value to check timestamp
-                lock_value = self.database.redis.get(lock_key, deserialize=False)
-                if lock_value:
-                    try:
-                        lock_data = json.loads(lock_value)
-                        lock_time = datetime.fromisoformat(lock_data.get('timestamp', ''))
-                        # If lock is older than 2 minutes, force release it
-                        if (datetime.now(timezone.utc) - lock_time).total_seconds() > 120:
-                            logger.warning(f"Found stale scaling lock (created {lock_time}), force-releasing")
-                            self.database.redis.delete(lock_key)
-                        else:
-                            logger.info("Scaling operation already in progress, skipping cycle")
-                            return False
-                    except (json.JSONDecodeError, ValueError):
-                        # If we can't parse the lock, just delete it
-                        logger.warning("Invalid scaling lock format, deleting")
-                        self.database.redis.delete(lock_key)
-                else:
-                    # Old format lock, just delete it
-                    logger.warning("Found old format scaling lock, deleting")
-                    self.database.redis.delete(lock_key)
+            if lock_id is None:
+                # Lock already held by another process
+                logger.info("Scaling operation already in progress (lock held), skipping cycle")
+                return False
 
-            # Set lock with timestamp and 60s expiry to prevent infinite locks
-            lock_data = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "action": action,
-                "count": count
-            }
-            self.database.redis.set(lock_key, json.dumps(lock_data), expire=60)
-            logger.info(f"Acquired scaling operation lock for {action}")
+            logger.info(f"Acquired scaling lock: {lock_id[:8]}... for {action}")
 
         try:
             if action == "scale_up":
@@ -211,11 +196,11 @@ class K3sAutoscaler:
             logger.error(f"Failed to execute scaling {action}: {e}")
             return False
         finally:
-            # Always release the lock
-            if hasattr(self.database, 'redis') and self.database.redis:
-                lock_key = REDIS_KEYS['SCALING_LOCK']
-                self.database.redis.delete(lock_key)
-                logger.info("Released scaling operation lock")
+            # Always release the lock (only if we own it)
+            if lock_id and hasattr(self.database, 'redis') and self.database.redis:
+                released = self.database.redis.release_scaling_lock(lock_id)
+                if not released:
+                    logger.warning(f"Lock {lock_id[:8]}... was already released or expired")
 
     def _scale_up(self, count: int, decision: Dict[str, Any]) -> bool:
         """Scale up by adding worker nodes using async operations"""
@@ -1004,6 +989,152 @@ class K3sAutoscaler:
             })
 
         return details
+
+    def _recover_from_wal(self):
+        """
+        Recover from incomplete operations using Write-Ahead Log.
+
+        Called on startup to handle operations that were interrupted by crashes.
+        """
+        if not hasattr(self.database, 'redis') or not self.database.redis:
+            logger.info("Redis not available, skipping WAL recovery")
+            return
+
+        incomplete_ops = self.database.redis.wal_get_incomplete()
+
+        if not incomplete_ops:
+            logger.info("No incomplete WAL operations to recover")
+            return
+
+        logger.warning(f"Found {len(incomplete_ops)} incomplete WAL operations")
+
+        for op in incomplete_ops:
+            op_id = op.get("operation_id")
+            op_type = op.get("operation_type")
+            worker_name = op.get("worker_name")
+            state = op.get("state", "unknown")
+
+            try:
+                if op_type == "scale_up":
+                    self._recover_scale_up(op)
+                elif op_type == "scale_down":
+                    self._recover_scale_down(op)
+                else:
+                    logger.warning(f"Unknown operation type: {op_type}")
+                    # Delete invalid entry
+                    self.database.redis.wal_delete(op_id)
+
+            except Exception as e:
+                logger.error(f"Failed to recover operation {op_id}: {e}")
+                # Leave WAL entry for manual inspection
+
+    def _recover_scale_up(self, op: Dict):
+        """Recover incomplete scale-up operation"""
+        worker_name = op.get("worker_name")
+        state = op.get("state", "unknown")
+        op_id = op.get("operation_id")
+
+        logger.info(f"Recovering scale-up: {worker_name} (state={state})")
+
+        # Check how far the operation got
+        if state in ["started", "reserved", "creating"]:
+            # Early stage - container may not exist
+            # Rollback counter and delete WAL
+            worker_num = op.get("worker_number")
+            if worker_num:
+                # Only rollback if container never created
+                logger.info(f"Rolling back early scale-up: {worker_name} (number {worker_num})")
+                # Clean up Redis state
+                self.database.redis.delete(f"workers:{worker_name}")
+                # Mark WAL as rolled back
+                self.database.redis.wal_update_state(op_id, "rollback", "Early failure recovery")
+
+        elif state == "verifying":
+            # Container created, check if it eventually succeeded
+            try:
+                # Check if container exists and is running
+                if not hasattr(self, 'docker_client'):
+                    self.docker_client = docker.from_env()
+
+                container = self.docker_client.containers.get(worker_name)
+                if container and container.status == "running":
+                    # Check if K8s node exists
+                    if hasattr(self.metrics, 'k8s_api') and self.metrics.k8s_api:
+                        from kubernetes import client
+                        try:
+                            self.metrics.k8s_api.read_node(worker_name)
+                            # Success! Worker is ready
+                            logger.info(f"Worker {worker_name} recovered successfully")
+                            self.database.redis.wal_complete(op_id, success=True)
+
+                            # Set worker state to READY
+                            self.database.redis.set_worker_state(
+                                worker_name,
+                                "ready",
+                                metadata={"recovered": "true", "recovered_at": datetime.now(timezone.utc).isoformat()}
+                            )
+                            return
+                        except client.exceptions.ApiException:
+                            pass
+
+                    # Container exists but K8s node doesn't - needs verification
+                    logger.warning(f"Worker {worker_name} container exists but K8s node not found")
+                    self.database.redis.wal_update_state(op_id, "verifying", "K8s node not found after recovery")
+
+                else:
+                    # Container doesn't exist - rollback
+                    logger.warning(f"Container {worker_name} not found during recovery")
+                    self.database.redis.wal_update_state(op_id, "failed", "Container not found")
+
+            except Exception as e:
+                logger.error(f"Error checking worker {worker_name}: {e}")
+                self.database.redis.wal_update_state(op_id, "failed", str(e))
+
+    def _recover_scale_down(self, op: Dict):
+        """Recover incomplete scale-down operation"""
+        worker_name = op.get("worker_name")
+        op_id = op.get("operation_id")
+
+        logger.info(f"Recovering scale-down: {worker_name}")
+
+        try:
+            # Check if worker still exists
+            if not hasattr(self, 'docker_client'):
+                self.docker_client = docker.from_env()
+
+            try:
+                container = self.docker_client.containers.get(worker_name)
+                # Container still exists - complete the removal
+                logger.info(f"Completing interrupted removal: {worker_name}")
+
+                # Remove from K8s if needed
+                if hasattr(self.metrics, 'k8s_api') and self.metrics.k8s_api:
+                    from kubernetes import client
+                    try:
+                        self.metrics.k8s_api.delete_node(worker_name)
+                        logger.info(f"Removed K8s node: {worker_name}")
+                    except client.exceptions.ApiException as e:
+                        if e.status != 404:
+                            logger.warning(f"Failed to delete K8s node {worker_name}: {e}")
+
+                # Remove container
+                container.remove(force=True)
+                logger.info(f"Removed container: {worker_name}")
+
+                # Clean up Redis
+                self.database.remove_worker(worker_name)
+
+                self.database.redis.wal_complete(op_id, success=True)
+
+            except docker.errors.NotFound:
+                # Container already gone - just clean up Redis
+                logger.info(f"Container {worker_name} already removed")
+                self.database.remove_worker(worker_name)
+                self.database.redis.wal_complete(op_id, success=True)
+
+        except Exception as e:
+            logger.error(f"Failed to recover scale-down for {worker_name}: {e}")
+            self.database.redis.wal_update_state(op_id, "failed", str(e))
 
     def _sync_database_with_cluster(self):
         """Sync database records with actual cluster state"""

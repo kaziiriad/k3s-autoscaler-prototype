@@ -298,6 +298,15 @@ class AsyncScalingManager:
                 for worker, result in zip(db_updates, db_results):
                     if isinstance(result, Exception):
                         error_messages.append(f"DB removal error for {worker.node_name}: {str(result)}")
+                    else:
+                        # Successfully removed from database
+                        # Per worker number strategy: Counter is NOT decremented on scale-down
+                        # The worker number is "retired" and will never be reused
+                        worker_num = self._extract_worker_number(worker.node_name)
+                        if worker_num:
+                            logger.info(f"Removed worker {worker.node_name} (number {worker_num} is retired)")
+                        else:
+                            logger.debug(f"Removed worker {worker.node_name} (could not extract number)")
             else:
                 logger.debug(" No workers verified as removed for database updates")
         else:
@@ -518,14 +527,38 @@ class AsyncScalingManager:
             logger.error(f"Failed to rollback worker number {worker_num}: {e}")
             return False
 
+    def _extract_worker_number(self, node_name: str) -> Optional[int]:
+        """
+        Extract the worker number from a node name.
+
+        Args:
+            node_name: Node name (e.g., "k3s-worker-1" or "k3s-worker-12")
+
+        Returns:
+            Worker number as integer, or None if not found
+        """
+        try:
+            # Extract number from node name (k3s-worker-N -> N)
+            # Handle both "worker-N" and "workerN" formats
+            import re
+            match = re.search(r'[-]?(\d+)$', node_name)
+            if match:
+                return int(match.group(1))
+            logger.warning(f"Could not extract worker number from node name: {node_name}")
+            return None
+        except Exception as e:
+            logger.error(f"Error extracting worker number from {node_name}: {e}")
+            return None
+
     def _cleanup_failed_worker(self, worker: WorkerNode, docker_client, error_msg: str) -> bool:
         """
-        Clean up a failed worker by removing container and rolling back worker number.
+        Clean up a failed worker.
 
-        This implements the rollback strategy for failed workers:
-        1. Remove Docker container (if it exists)
-        2. Remove from Redis sets
-        3. Rollback worker number (decrement counter)
+        Per worker number strategy:
+        - If container was created: number is "burned", don't rollback counter
+        - If container never created: safe to rollback counter (early failure)
+
+        This prevents number reuse even for workers that failed after container creation.
 
         Args:
             worker: The failed worker node
@@ -535,8 +568,11 @@ class AsyncScalingManager:
         Returns:
             True if cleanup succeeded, False otherwise
         """
-        cleanup_success = True
         worker_num = worker.metadata.get("worker_number") if worker.metadata else None
+
+        # Determine if this is an early failure (container never created)
+        # by checking if container_id exists and is valid
+        container_created = worker.container_id is not None and worker.container_id != ""
 
         try:
             # 1. Remove Docker container if it exists
@@ -545,7 +581,7 @@ class AsyncScalingManager:
                 container.remove(force=True)
                 logger.info(f"Removed failed container: {worker.node_name}")
             except Exception as container_error:
-                logger.warning(f"Could not remove container {worker.node_name}: {container_error}")
+                logger.debug(f"Container removal error (may not exist): {container_error}")
 
             # 2. Remove from Redis sets
             self.redis_client.set_remove(REDIS_KEYS['WORKERS_ALL'], worker.node_name)
@@ -555,9 +591,21 @@ class AsyncScalingManager:
             worker_hash_key = f"worker:{worker.node_name}"
             self.redis_client.delete(worker_hash_key)
 
-            # 4. Rollback worker number if we have it
+            # 4. Rollback worker number ONLY for early failures
+            # If container was created, the number is "burned" and never reused
             if worker_num:
-                self._rollback_worker_number(worker_num, f"Worker verification failed: {error_msg}")
+                if container_created:
+                    logger.info(
+                        f"Worker {worker.node_name} had container created, "
+                        f"number {worker_num} is retired (not rolled back)"
+                    )
+                else:
+                    # Early failure - safe to rollback
+                    logger.info(
+                        f"Worker {worker.node_name} failed before container creation, "
+                        f"rolling back number {worker_num}"
+                    )
+                    self._rollback_worker_number(worker_num, f"Early failure: {error_msg}")
 
             logger.info(f"Successfully cleaned up failed worker: {worker.node_name}")
             return True

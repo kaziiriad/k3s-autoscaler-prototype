@@ -15,13 +15,64 @@ from enum import Enum
 
 
 class NodeStatus(str, Enum):
-    """Worker node status enum"""
-    INITIALIZING = "initializing"
-    READY = "ready"
-    DRAINING = "draining"
-    REMOVING = "removing"
-    REMOVED = "removed"
-    ERROR = "error"
+    """
+    Worker node status enum with state machine transitions.
+
+    Valid transitions (enforced by CAS):
+    - Creation flow: RESERVED → CREATING → VERIFYING → READY
+    - Removal flow: READY → DRAINING → REMOVING → REMOVED
+    - Error states: Any state → FAILED/ROLLBACK (terminal)
+    """
+    # Creation flow
+    RESERVED = "reserved"        # Number allocated, not created yet
+    CREATING = "creating"        # Docker container being created
+    VERIFYING = "verifying"      # Waiting for K8s node registration
+    READY = "ready"              # Fully operational
+
+    # Removal flow
+    DRAINING = "draining"        # K8s node being drained
+    REMOVING = "removing"        # Container being removed
+    REMOVED = "removed"          # Cleanup complete
+
+    # Error states (terminal)
+    FAILED = "failed"            # Operation failed
+    ROLLBACK = "rollback"        # Being rolled back
+
+    # Legacy (for backward compatibility)
+    INITIALIZING = "initializing"  # Alias for CREATING
+    ERROR = "error"              # Alias for FAILED
+
+
+# Valid state transitions for CAS enforcement
+VALID_STATE_TRANSITIONS = {
+    NodeStatus.RESERVED: [NodeStatus.CREATING, NodeStatus.FAILED, NodeStatus.ROLLBACK],
+    NodeStatus.CREATING: [NodeStatus.VERIFYING, NodeStatus.FAILED, NodeStatus.ROLLBACK],
+    NodeStatus.VERIFYING: [NodeStatus.READY, NodeStatus.FAILED],
+    NodeStatus.READY: [NodeStatus.DRAINING, NodeStatus.FAILED],
+    NodeStatus.DRAINING: [NodeStatus.REMOVING, NodeStatus.FAILED],
+    NodeStatus.REMOVING: [NodeStatus.REMOVED, NodeStatus.FAILED],
+    # Terminal states
+    NodeStatus.FAILED: [],
+    NodeStatus.REMOVED: [],
+    NodeStatus.ROLLBACK: [],
+    # Legacy compatibility
+    NodeStatus.INITIALIZING: [NodeStatus.VERIFYING, NodeStatus.FAILED],
+    NodeStatus.ERROR: [],
+}
+
+
+def can_transition(from_state: NodeStatus, to_state: NodeStatus) -> bool:
+    """
+    Check if a state transition is valid.
+
+    Args:
+        from_state: Current state
+        to_state: Desired next state
+
+    Returns:
+        True if transition is valid, False otherwise
+    """
+    return to_state in VALID_STATE_TRANSITIONS.get(from_state, [])
 
 
 class ScalingEventType(str, Enum):
