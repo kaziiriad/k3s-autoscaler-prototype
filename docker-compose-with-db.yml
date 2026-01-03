@@ -58,7 +58,7 @@ services:
     container_name: monitoring-deployer
     volumes:
       - ./monitoring:/manifests:ro
-      - ./kubeconfig:/kubeconfig:ro
+      - ./kubeconfig:/kubeconfig  # Writable mount to receive updates from kubeconfig-fixer
     command:
       - sh
       - -c
@@ -83,12 +83,13 @@ services:
         condition: service_completed_successfully
     restart: "no"
 
-  # K3s Worker Nodes
+  # K3s Worker Nodes (Permanent workers - 4GB each)
   k3s-worker-1:
     image: rancher/k3s:v1.29.1-k3s1
     container_name: k3s-worker-1
     hostname: k3s-worker-1
     privileged: true
+    mem_limit: 4g
     environment:
       - K3S_URL=https://k3s-master:6443
       - K3S_TOKEN=mysupersecrettoken12345
@@ -107,6 +108,7 @@ services:
     container_name: k3s-worker-2
     hostname: k3s-worker-2
     privileged: true
+    mem_limit: 4g
     environment:
       - K3S_URL=https://k3s-master:6443
       - K3S_TOKEN=mysupersecrettoken12345

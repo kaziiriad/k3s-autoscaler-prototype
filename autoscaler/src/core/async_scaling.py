@@ -452,6 +452,7 @@ class AsyncScalingManager:
                     detach=True,
                     privileged=True,
                     hostname=node_name,
+                    mem_limit='2g',  # Scaled workers get 2GB (permanent get 4GB)
                     environment={
                         'K3S_URL': f"https://{settings.kubernetes.server_host or 'k3s-master'}:6443",
                         'K3S_TOKEN': settings.autoscaler.k3s_token,
